@@ -1,0 +1,16 @@
+[package]
+name = "plain-bench"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+plain-contracts = { path = "../plain-contracts", features = ["dev-telemetry"] }
+plain-persist = { path = "../plain-persist" }
+plain-world = { path = "../plain-world", features = ["dev-telemetry"] }
+plain-worldgen = { path = "../plain-worldgen" }
+serde.workspace = true
+serde_json.workspace = true
+
+[lints]
+workspace = true

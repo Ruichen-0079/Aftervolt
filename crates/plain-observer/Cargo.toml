@@ -1,0 +1,18 @@
+[package]
+name = "plain-observer"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+clap.workspace = true
+eframe.workspace = true
+egui.workspace = true
+egui_plot.workspace = true
+plain-contracts = { path = "../plain-contracts", features = ["dev-telemetry"] }
+plain-persist = { path = "../plain-persist" }
+plain-world = { path = "../plain-world", features = ["dev-telemetry"] }
+plain-worldgen = { path = "../plain-worldgen" }
+
+[lints]
+workspace = true

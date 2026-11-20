@@ -1,0 +1,21 @@
+# Rust build artifacts
+/target/
+**/*.rs.bk
+*.pdb
+
+# Local raw design draft (kept local-only)
+/plain.txt
+
+# Local save files & SQLite WAL artifacts
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+*.db
+
+# OS & editor clutter
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*.swo
+*~

@@ -1,0 +1,20 @@
+[package]
+name = "plain-contracts"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[features]
+default = ["dev-telemetry"]
+# Compile-time boundary isolating god-view developer telemetry from future player perception (F7)
+dev-telemetry = []
+
+[dependencies]
+blake3.workspace = true
+libm.workspace = true
+rand_chacha.workspace = true
+rand_core.workspace = true
+serde.workspace = true
+
+[lints]
+workspace = true
