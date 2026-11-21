@@ -6,6 +6,8 @@ use plain_contracts::telemetry::{CellProbeReport, ConservationLedger};
 use plain_contracts::{CellCoord, DevTelemetryPort, OverlayKind, ViewportRect};
 use plain_world::WorldSimulation;
 
+mod fonts;
+
 pub fn run_gui(sim: WorldSimulation) -> eframe::Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
@@ -14,9 +16,20 @@ pub fn run_gui(sim: WorldSimulation) -> eframe::Result<()> {
         ..Default::default()
     };
     eframe::run_native(
-        "Electroruin Plain Developer Observer",
+        "Aftervolt Developer Observer",
         options,
-        Box::new(|_cc| Ok(Box::new(ObserverApp::new(sim)))),
+        Box::new(|cc| {
+            match fonts::install(&cc.egui_ctx) {
+                Some((path, index)) => eprintln!(
+                    "plain-observer: loaded CJK font {} (face {index})",
+                    path.display()
+                ),
+                None => eprintln!(
+                    "plain-observer: no usable CJK font found. Install a Simplified Chinese font or set PLAIN_OBSERVER_FONT to its path."
+                ),
+            }
+            Ok(Box::new(ObserverApp::new(sim)))
+        }),
     )
 }
 
@@ -394,6 +407,7 @@ impl eframe::App for ObserverApp {
             let avail = ui.available_size();
             let aspect = (avail.x / avail.y.max(1.0)) as f64;
             let vp = self.current_viewport(aspect);
+            // Panning and zooming update the telemetry viewport only.
             self.sim.set_dev_camera(0, vp);
 
             let tex_w = (avail.x as u32).clamp(160, 1280);

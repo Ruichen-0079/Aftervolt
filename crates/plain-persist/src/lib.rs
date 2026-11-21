@@ -12,5 +12,8 @@ pub mod schema;
 pub mod store;
 
 pub use hash::{hash_to_hex, world_state_hash};
-pub use schema::{ChunkBlobV1, VersionedChunkBlob, VersionedWorldMeta, WorldMetaV1, WorldMetaV2};
+pub use schema::{
+    ChunkBlobV1, ChunkBlobV2, VersionedChunkBlob, VersionedWorldMeta, WorldMetaV1, WorldMetaV2,
+    WorldMetaV3,
+};
 pub use store::{PersistError, SaveStats, WorldSaveStore};

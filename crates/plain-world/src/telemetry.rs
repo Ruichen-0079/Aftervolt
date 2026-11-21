@@ -177,15 +177,15 @@ impl DevTelemetryPort for WorldSimulation {
                 for cy in 0..(self.world.config.dimensions.chunks_y as usize) {
                     for cx in c0..=c1 {
                         let l1 = &self.world.l1_chunks[cy * chunks_x + cx];
-                        for i in 0..l1.ph_scaled.len() {
-                            ph_sum += l1.ph_scaled[i] as u64;
+                        for i in 0..l1.ph_milli.len() {
+                            ph_sum += l1.ph_milli[i] as u64;
                             f_sum += l1.fertility[i] as u64;
                             cnt += 1;
                         }
                     }
                 }
                 let avg_ph = if cnt > 0 {
-                    (ph_sum as f32 / cnt as f32) * 0.1
+                    (ph_sum as f32 / cnt as f32) * 0.001
                 } else {
                     7.0
                 };

@@ -22,6 +22,8 @@ Built from the ground up in pure Rust without game-engine coupling, Aftervolt si
 - **F8 — Single-File SQLite WAL Persistence**: Full Zstd-compressed `world_baseline` + atomic incremental `dirty_chunks` + explicit dual versioning (`schema_version` / `worldgen_version`) with schema migration support.
 - **F9 — Lightweight Real-Time Developer Observer**: Native `eframe`/`egui` observer for live world inspection, environmental overlays, time stepping, and profiler telemetry, decoupled from player perception.
 
+Runtime saves use SQLite WAL for incremental throughput and may create `-wal` and `-shm` companions. Before shutdown or export, close all other connections and call `WorldSaveStore::close()`. It performs a truncating checkpoint and closes the final connection so the resulting `.sqlite` is standalone. Schema V3 migrates pH to milli-pH and archives future macro flux. V1/V2 saves can resume from the oldest retained record where a historical prefix had already been discarded.
+
 ---
 
 ## Workspace Structure
@@ -74,7 +76,7 @@ cargo run --release -p plain-bench
 
 ## Current Status
 
-- **Stage 1 (World Core Foundation)**: Implemented and independently verified — deterministic multi-scale worldgen, 100/100 seed legality pass, `0 µL` exact water conservation over `3×1220` game days, bidirectional thin-wall `L1` field/electric isolation, V1→V2 SQLite WAL + Zstd persistence roundtrip, and real-time `eframe`/`egui` developer observer.
+- **Stage 1 (World Core Foundation)**: Implemented and independently verified — deterministic multi-scale worldgen, 100/100 seed legality pass, `0 µL` exact water conservation over `3×1220` game days, bidirectional thin-wall `L1` field/electric isolation, V1/V2→V3 SQLite WAL + Zstd persistence roundtrip, and real-time `eframe`/`egui` developer observer.
 
 ---
 

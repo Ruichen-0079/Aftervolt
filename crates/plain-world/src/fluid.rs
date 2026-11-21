@@ -33,7 +33,7 @@ pub fn step_fluid_active_chunks(
         .sum();
 
     // Phase B: Deterministic cross-chunk border transfers (bottom->top vertical seams, then L<->R horizontal seams).
-    // Only touches the 64-cell border strips between adjacent chunks where at least one chunk is active & awake.
+    // Only touches the 64-cell border strips between adjacent chunks where both chunks are active and at least one is awake.
     let mut border_moves = 0u32;
 
     // B.1 Vertical seams: fluid falling from cy into cy - 1 (y=0 of upper -> y=63 of lower).
@@ -41,7 +41,7 @@ pub fn step_fluid_active_chunks(
         for cx in 0..chunks_x {
             let upper_idx = cy * chunks_x + cx;
             let lower_idx = (cy - 1) * chunks_x + cx;
-            if (!active_mask[upper_idx] && !active_mask[lower_idx])
+            if (!active_mask[upper_idx] || !active_mask[lower_idx])
                 || (world.l0_chunks[upper_idx].sleep.fluid_sleeping
                     && world.l0_chunks[lower_idx].sleep.fluid_sleeping)
             {
@@ -101,7 +101,7 @@ pub fn step_fluid_active_chunks(
             while cx + 1 < chunks_x {
                 let left_idx = cy * chunks_x + cx;
                 let right_idx = left_idx + 1;
-                if (active_mask[left_idx] || active_mask[right_idx])
+                if (active_mask[left_idx] && active_mask[right_idx])
                     && (!world.l0_chunks[left_idx].sleep.fluid_sleeping
                         || !world.l0_chunks[right_idx].sleep.fluid_sleeping)
                 {

@@ -71,6 +71,8 @@ pub fn generate_world(
     // Step 3: Surface sculpting, hydraulic erosion, travertine pools, arches & pillars
     terrain_sculpt::sculpt_surface_and_strata(&mut world);
 
+    world.surface_reference_height = world.topology.surface_height.clone();
+
     // Step 4: Karst caves, deep dark-river aquifer, vertical sinkholes & fossil cavities
     underground::carve_underground_and_sinkholes(&mut world);
 
@@ -89,7 +91,22 @@ pub fn generate_world(
         ch.last_realized_macro_step = 0;
     }
 
-    // Step 8: Run automated legality validation gates
+    // At open karst mouths the survey elevation defines the open portal.
+    // Everywhere with a solid ground datum, runtime weathering uses the
+    // highest actual solid, including pillars and outcrops.
+    for x in 0..world.width_cells() {
+        let surveyed = world.topology.surface_height[x];
+        let cell = |y| plain_contracts::CellCoord::new(x as i32, y);
+        if world.get_material(cell(i32::from(surveyed))).is_solid() {
+            if let Some(y) = (usize::from(surveyed) + 1..world.height_cells())
+                .rev()
+                .find(|&y| world.get_material(cell(y as i32)).is_solid())
+            {
+                world.topology.surface_height[x] = y as u16;
+            }
+        }
+    }
+    // Step 8: Run automated legality validation gates.
     let report = validator::validate_world(&world);
     Ok((world, report))
 }

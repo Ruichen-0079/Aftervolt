@@ -1,0 +1,22 @@
+name: World Core CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    env:
+      RUSTFLAGS: "-D warnings"
+      RAYON_NUM_THREADS: "8"
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install CJK fonts
+        run: sudo apt-get update && sudo apt-get install -y fonts-noto-cjk
+      - run: cargo test --workspace --release
+      - run: cargo build --workspace --release
+      - run: target/release/plain-observer validate-seeds --count 100 --chunks-x 16 --chunks-y 8
+      - run: target/release/plain-observer sim-cycles --seed 42 --chunks-x 16 --chunks-y 8 --days 3660

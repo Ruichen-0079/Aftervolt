@@ -18,7 +18,8 @@ pub fn step_macro_climate(world: &mut WorldState) -> bool {
         return false;
     }
 
-    let steps_per_day = world.config.clock.macro_steps_per_game_day.max(1) as f32;
+    let daily_steps = u64::from(world.config.clock.macro_steps_per_game_day.max(1));
+    let steps_per_day = daily_steps as f32;
     let dt_days = 1.0 / steps_per_day;
     let cfg = world.config.four_era_cycle;
     let cycle_days = (cfg.target_cycle_days.max(40)) as f32;
@@ -85,6 +86,21 @@ pub fn step_macro_climate(world: &mut WorldState) -> bool {
     let day_hour_norm = ((current_step % (steps_per_day as u64)) as f32) / steps_per_day;
     let is_night = !(0.22..=0.78).contains(&day_hour_norm);
 
+    // Preserve exact archived totals on both sides of every live chunk cursor.
+    let mut cursors = Vec::new();
+    if world.regions.iter().any(|r| {
+        r.flux_history.max_len > 0 && r.flux_history.records.len() >= r.flux_history.max_len
+    }) {
+        cursors.extend(
+            world
+                .l0_chunks
+                .iter()
+                .map(|chunk| chunk.last_realized_macro_step),
+        );
+        cursors.sort_unstable();
+        cursors.dedup();
+    }
+
     for r in &mut world.regions {
         r.era_elapsed_macro_steps += 1;
         let span_cols = (r.x_end.saturating_sub(r.x_start)).max(1) as i64;
@@ -97,7 +113,8 @@ pub fn step_macro_climate(world: &mut WorldState) -> bool {
         let mut fert_delta = 0.0f32;
         let mut sal_delta = 0.0f32;
         let ambient_charge_v: f32;
-        let mut net_water_per_col = 0;
+        let mut evaporation_per_col = 0.0;
+        let mut condensed_water = 0;
 
         match r.era {
             // =================================================================
@@ -117,8 +134,7 @@ pub fn step_macro_climate(world: &mut WorldState) -> bool {
                 r.dust_saturation = (r.dust_saturation * 0.995).clamp(0.0, 1.0);
 
                 // Conserved evaporation from surface/pending water into basin atmosphere
-                let evap = ((span_cols * 35) as f64 * step_rate as f64 * 60.0) as i64;
-                net_water_per_col = evaporate_pending(r, evap, span_cols);
+                evaporation_per_col = f64::from(step_rate) * 2_100.0;
 
                 // Near-ground conductive ion mist from dense flower canopy drives BallLightning & Aurora nights
                 r.weather = if is_night && r.moisture_index > 0.45 && (current_step % 7 < 3) {
@@ -161,8 +177,7 @@ pub fn step_macro_climate(world: &mut WorldState) -> bool {
                     (r.charge_index + step_rate * (0.88 + 0.35 * dryness as f32)).clamp(0.0, 1.0);
                 r.dust_saturation = (r.dust_saturation + step_rate * 0.32).clamp(0.0, 1.0);
 
-                let evap = ((span_cols * 14) as f64 * step_rate as f64 * 40.0) as i64;
-                net_water_per_col = evaporate_pending(r, evap, span_cols);
+                evaporation_per_col = f64::from(step_rate) * 1_000.0;
 
                 r.surface_charge_uc = ((r.charge_index as f64) * 1_000_000.0) as i64;
                 r.mineral_dust_units =
@@ -225,12 +240,12 @@ pub fn step_macro_climate(world: &mut WorldState) -> bool {
 
                 // Conserved heavy precipitation from basin atmosphere back to surface/pending water
                 let precip_target =
-                    ((r.water_vapor_ul.max(0) as f64) * (step_rate as f64 * 0.45)) as i64;
+                    ((r.water_vapor_ul.max(0) as f64) * (step_rate as f64 * 0.30)) as i64;
                 let precip = precip_target.min(r.water_vapor_ul.max(0));
                 r.water_vapor_ul -= precip;
+                condensed_water = precip;
                 r.pending_surface_water_ul += precip;
                 r.precipitation_remainder_ul += precip;
-                net_water_per_col = take_per_column(&mut r.precipitation_remainder_ul, span_cols);
 
                 r.mineral_dust_units =
                     ((r.mineral_dust_units as f32) * (1.0 - step_rate * 0.6).max(0.0)) as i64;
@@ -265,39 +280,47 @@ pub fn step_macro_climate(world: &mut WorldState) -> bool {
             + (1.0 - r.salt_crust_ratio) * 0.20)
             .clamp(0.0, 1.0);
 
-        r.flux_history.push(MacroFluxRecord {
-            macro_step: current_step,
-            era: r.era as u8,
-            weather: r.weather as u8,
-            acid_erosion_impulse: acid_impulse,
-            salt_deposition_impulse: salt_dep_impulse,
-            flood_peak,
-            ph_delta,
-            fertility_delta: fert_delta,
-            salinity_delta: sal_delta,
-            ambient_charge_v,
-            net_water_delta_per_col: net_water_per_col,
-        });
+        if evaporation_per_col > 0.0 {
+            // A dry atmosphere steepens the vapor pressure gradient, drawing more
+            // water through the soil and the geothermal aquifer.
+            let vapor_per_col = r.water_vapor_ul as f64 / span_cols as f64;
+            let deficit = (18_000.0 - vapor_per_col).max(0.0);
+            evaporation_per_col += (deficit / 180.0).min(55.0) * f64::from(dt_days);
+            r.evaporation_remainder_ul += (evaporation_per_col * span_cols as f64).round() as i64;
+        }
+
+        r.flux_history.push_preserving_cursors(
+            MacroFluxRecord {
+                macro_step: current_step,
+                era: prev_era as u8,
+                weather: r.weather as u8,
+                acid_erosion_impulse: acid_impulse,
+                salt_deposition_impulse: salt_dep_impulse,
+                flood_peak,
+                ph_delta,
+                fertility_delta: fert_delta,
+                salinity_delta: sal_delta,
+                ambient_charge_v,
+                // New water transfers settle directly from the basin ledger at the
+                // day boundary. This channel remains for deferred legacy transfers.
+                net_water_delta_per_col: 0,
+                settled_water_ul: condensed_water,
+            },
+            &cursors,
+        );
     }
 
+    if current_step % daily_steps == 0 {
+        for id in 0..n_regions {
+            let evaporated =
+                crate::catchup::settle_basin_water(world, id, current_step / daily_steps);
+            world.regions[id]
+                .flux_history
+                .records
+                .last_mut()
+                .unwrap()
+                .settled_water_ul -= evaporated;
+        }
+    }
     any_transition
-}
-
-/// Redistribute whole multiples of the basin width while retaining every unissued microliter.
-fn take_per_column(remainder_ul: &mut i64, span_cols: i64) -> i32 {
-    let per_col = (*remainder_ul / span_cols).min(i32::MAX as i64);
-    *remainder_ul -= per_col * span_cols;
-    per_col as i32
-}
-
-fn evaporate_pending(region: &mut crate::spatial::MacroRegion, demand: i64, span_cols: i64) -> i32 {
-    let from_pending = demand.min(region.pending_surface_water_ul);
-    region.pending_surface_water_ul -= from_pending;
-    region.water_vapor_ul += from_pending;
-    region.precipitation_remainder_ul = region
-        .precipitation_remainder_ul
-        .saturating_sub(from_pending)
-        .max(0);
-    region.evaporation_remainder_ul += demand - from_pending;
-    -take_per_column(&mut region.evaporation_remainder_ul, span_cols)
 }

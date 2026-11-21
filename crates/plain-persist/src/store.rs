@@ -8,7 +8,7 @@ use rayon::prelude::*;
 use rusqlite::{params, Connection};
 use thiserror::Error;
 
-use crate::schema::{ChunkBlobV1, VersionedChunkBlob, VersionedWorldMeta, WorldMetaV2};
+use crate::schema::{ChunkBlobV2, VersionedChunkBlob, VersionedWorldMeta, WorldMetaV3};
 
 #[derive(Debug, Error)]
 pub enum PersistError {
@@ -20,6 +20,8 @@ pub enum PersistError {
     Io(#[from] std::io::Error),
     #[error("corrupt or missing save metadata key: {0}")]
     MissingMeta(&'static str),
+    #[error("WAL checkpoint blocked by an active SQLite connection")]
+    WalCheckpointBusy,
     #[error("legacy water debt exceeds the available water in the save")]
     InvalidLegacyWater,
     #[error("chunk count mismatch: expected {expected}, loaded {actual}")]
@@ -35,7 +37,8 @@ pub struct SaveStats {
     pub file_size_bytes: u64,
 }
 
-/// Single-file SQLite WAL world store (F8).
+/// SQLite world store (F8). Runtime writes use WAL and may create `-wal` and
+/// `-shm` companions. Closing the last connection checkpoints to a standalone database.
 ///
 /// Design invariants:
 /// 1. At world genesis, `save_full_baseline` persists every chunk (L0+L1) compressed with Zstd
@@ -59,6 +62,26 @@ impl WorldSaveStore {
             conn,
             zstd_level: 3,
         })
+    }
+
+    /// Merge committed WAL frames into the database and truncate the log.
+    pub fn checkpoint_truncate(&mut self) -> Result<(), PersistError> {
+        let (busy, _, _): (i32, i32, i32) =
+            self.conn
+                .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
+                    Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+                })?;
+        if busy != 0 {
+            return Err(PersistError::WalCheckpointBusy);
+        }
+        Ok(())
+    }
+
+    /// Checkpoint and release the connection. SQLite removes the companion files
+    /// when the last connection closes. Close all connections before export.
+    pub fn close(mut self) -> Result<(), PersistError> {
+        self.checkpoint_truncate()?;
+        self.conn.close().map_err(|(_, error)| error.into())
     }
 
     fn init_tables(conn: &Connection) -> Result<(), PersistError> {
@@ -105,7 +128,7 @@ impl WorldSaveStore {
             .map(|(ci, (l0, l1))| {
                 let cx = (ci % chunks_x) as i32;
                 let cy = (ci / chunks_x) as i32;
-                let blob = VersionedChunkBlob::V1(ChunkBlobV1 {
+                let blob = VersionedChunkBlob::V2(ChunkBlobV2 {
                     l0: l0.clone(),
                     l1: l1.clone(),
                 });
@@ -186,7 +209,7 @@ impl WorldSaveStore {
                 let l0 = &world.l0_chunks[ci];
                 let l1 = &world.l1_chunks[ci];
                 let step = l0.last_realized_macro_step as i64;
-                let blob = VersionedChunkBlob::V1(ChunkBlobV1 {
+                let blob = VersionedChunkBlob::V2(ChunkBlobV2 {
                     l0: l0.clone(),
                     l1: l1.clone(),
                 });
@@ -246,7 +269,8 @@ impl WorldSaveStore {
             .map_err(|_| PersistError::MissingMeta("world_meta_v1"))?;
         let meta_raw = zstd::stream::decode_all(&meta_comp[..])?;
         let versioned_meta: VersionedWorldMeta = postcard::from_bytes(&meta_raw)?;
-        let legacy = matches!(versioned_meta, VersionedWorldMeta::V1(_));
+        let legacy_water = matches!(versioned_meta, VersionedWorldMeta::V1(_));
+        let legacy_history = !matches!(versioned_meta, VersionedWorldMeta::V3(_));
         let meta = versioned_meta.migrate_to_current();
 
         let chunks_x = meta.config.dimensions.chunks_x as usize;
@@ -282,7 +306,7 @@ impl WorldSaveStore {
         }
 
         // Parallel decompress & deserialize chunks
-        let decoded: Result<Vec<(usize, ChunkBlobV1)>, PersistError> = raw_rows
+        let decoded: Result<Vec<(usize, ChunkBlobV2)>, PersistError> = raw_rows
             .into_par_iter()
             .map(|(idx, comp)| {
                 let raw = zstd::stream::decode_all(&comp[..])?;
@@ -309,16 +333,36 @@ impl WorldSaveStore {
             l1_chunks,
             regions: meta.regions,
             topology: meta.topology,
+            surface_reference_height: meta.surface_reference_height,
+            surface_salt_inventory: meta.surface_salt_inventory,
             initial_world_water_ul: meta.initial_world_water_ul,
         };
-        if legacy {
+        if legacy_water {
             reconcile_legacy_water(&mut world)?;
+        }
+        if legacy_history {
+            // Old versions discarded the prefix before saving. Rebase only across
+            // that unrecoverable prefix, retaining all records still on disk.
+            for (ci, chunk) in world.l0_chunks.iter_mut().enumerate() {
+                let x = ci % chunks_x * CHUNK_SIZE;
+                for region in &world.regions {
+                    if x < region.x_end && x + CHUNK_SIZE > region.x_start {
+                        let recovered = chunk
+                            .last_realized_macro_step
+                            .max(region.flux_history.discarded_through);
+                        if recovered != chunk.last_realized_macro_step {
+                            chunk.last_realized_macro_step = recovered;
+                            chunk.sleep.dirty_for_save = true;
+                        }
+                    }
+                }
+            }
         }
         Ok(world)
     }
 
     fn encode_meta(world: &WorldState, zstd_level: i32) -> Result<Vec<u8>, PersistError> {
-        let meta = VersionedWorldMeta::V2(WorldMetaV2 {
+        let meta = VersionedWorldMeta::V3(WorldMetaV3 {
             schema_version: CURRENT_SCHEMA_VERSION,
             worldgen_version: world.worldgen_version,
             seed: world.seed,
@@ -327,6 +371,8 @@ impl WorldSaveStore {
             initial_world_water_ul: world.initial_world_water_ul,
             regions: world.regions.clone(),
             topology: world.topology.clone(),
+            surface_reference_height: world.surface_reference_height.clone(),
+            surface_salt_inventory: world.surface_salt_inventory.clone(),
         });
         let raw = postcard::to_allocvec(&meta)?;
         Ok(zstd::bulk::compress(&raw, zstd_level)?)

@@ -156,7 +156,9 @@ pub fn carve_underground_and_sinkholes(world: &mut WorldState) {
                 } else if dist2 <= 1.12 {
                     // Ribbed mineralized bone shell with openings between ribs
                     if ((dx.abs() % 7) <= 3) || dy < 0 {
-                        world.set_solid_unchecked_gen(cell, MaterialId::MINERALIZED_BONE);
+                        if !is_open_sinkhole_cell(world, cell) {
+                            world.set_solid_unchecked_gen(cell, MaterialId::MINERALIZED_BONE);
+                        }
                     } else {
                         world.set_solid_unchecked_gen(cell, MaterialId::AIR);
                     }
@@ -166,4 +168,14 @@ pub fn carve_underground_and_sinkholes(world: &mut WorldState) {
         fossils.push((CellCoord::new(fx, fy), rx as u16));
     }
     world.topology.fossil_cavities = fossils;
+}
+
+/// Later worldgen features must leave an already carved shaft open.
+pub(crate) fn is_open_sinkhole_cell(world: &WorldState, cell: CellCoord) -> bool {
+    world.topology.sinkholes.iter().any(|shaft| {
+        cell.y >= shaft.bottom_y
+            && cell.y <= shaft.top_y
+            && cell.x.abs_diff(shaft.x_center) <= u32::from(shaft.mean_radius) + 15
+            && world.get_material(cell).is_air()
+    })
 }

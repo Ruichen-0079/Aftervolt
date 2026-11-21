@@ -190,7 +190,7 @@ impl TerrainChunkSoA {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FieldChunkSoA {
     pub axis_len: u8,
-    pub ph_scaled: Vec<u8>,
+    pub ph_milli: Vec<u16>,
     pub fertility: Vec<u16>,
     pub salinity: Vec<u16>,
     pub temperature_dk: Vec<u16>,
@@ -210,7 +210,7 @@ impl FieldChunkSoA {
         let n = axis * axis;
         Self {
             axis_len: axis as u8,
-            ph_scaled: vec![PhScaled::NEUTRAL.0; n],
+            ph_milli: vec![u16::from(PhScaled::NEUTRAL.0) * 100; n],
             fertility: vec![18_000; n],
             salinity: vec![2_000; n],
             temperature_dk: vec![DeciKelvin::AMBIENT_20C.0; n],
@@ -231,7 +231,7 @@ impl FieldChunkSoA {
 
     #[inline]
     pub fn estimated_bytes(&self) -> usize {
-        self.ph_scaled.capacity()
+        self.ph_milli.capacity() * 2
             + self.fertility.capacity() * 2
             + self.salinity.capacity() * 2
             + self.temperature_dk.capacity() * 2
@@ -277,14 +277,51 @@ pub struct MacroFluxRecord {
     pub ambient_charge_v: f32,
     /// Net rainfall (+) or evaporation (-) micro-liters per surface cell for conservation sync.
     pub net_water_delta_per_col: i32,
+    /// Net atmosphere-to-surface/pending transfer already settled by the macro water ledger.
+    pub settled_water_ul: i64,
 }
 
-/// Bounded ring buffer of regional macro flux records (supports lazy catch-up across >= 2 full 1220-day cycles).
+/// Conserved totals and peak forcing for a contiguous run of evicted macro steps.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ArchivedFluxRecord {
+    pub start_step: u64,
+    pub end_step: u64,
+    pub era: u8,
+    pub acid: f64,
+    pub salt: f64,
+    pub flood_peak: f32,
+    pub flood_exposure: f64,
+    pub ph: f64,
+    pub fertility: f64,
+    pub salinity: f64,
+    pub charge: f64,
+    pub water_per_col: i64,
+    pub settled_water_ul: i64,
+}
+
+impl ArchivedFluxRecord {
+    fn append(&mut self, record: MacroFluxRecord) {
+        self.end_step = record.macro_step;
+        self.acid += f64::from(record.acid_erosion_impulse);
+        self.salt += f64::from(record.salt_deposition_impulse);
+        self.flood_peak = self.flood_peak.max(record.flood_peak);
+        self.flood_exposure += f64::from(record.flood_peak);
+        self.ph += f64::from(record.ph_delta);
+        self.fertility += f64::from(record.fertility_delta);
+        self.salinity += f64::from(record.salinity_delta);
+        self.charge += f64::from(record.ambient_charge_v);
+        self.water_per_col += i64::from(record.net_water_delta_per_col);
+        self.settled_water_ul += record.settled_water_ul;
+    }
+}
+
+/// Bounded detailed history with a compact archive of older, contiguous era runs.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct RegionalMacroFluxHistory {
     pub records: Vec<MacroFluxRecord>,
     pub max_len: usize,
-    /// Last step intentionally evicted by history retention.
+    pub archived_buckets: Vec<ArchivedFluxRecord>,
+    /// Last step moved out of the detailed history.
     pub discarded_through: u64,
 }
 
@@ -293,16 +330,49 @@ impl RegionalMacroFluxHistory {
         Self {
             records: Vec::with_capacity(max_len.min(4096)),
             max_len,
+            archived_buckets: Vec::new(),
             discarded_through: 0,
         }
     }
 
     pub fn push(&mut self, rec: MacroFluxRecord) {
+        self.push_preserving_cursors(rec, &[]);
+    }
+
+    pub(crate) fn push_preserving_cursors(&mut self, rec: MacroFluxRecord, cursors: &[u64]) {
         if self.max_len > 0 && self.records.len() >= self.max_len {
-            // Drop oldest quarter in batch to keep amortized O(1) while preserving contiguous slices.
-            let drop_n = (self.max_len / 4).max(1);
-            self.discarded_through = self.records[drop_n - 1].macro_step;
-            self.records.drain(0..drop_n);
+            let over_capacity = self.records.len() + 1 - self.max_len;
+            let drop_n = (self.max_len / 4).max(over_capacity);
+            for old in self.records.drain(0..drop_n) {
+                let water = i64::from(old.net_water_delta_per_col);
+                let append = self.archived_buckets.last().is_some_and(|bucket| {
+                    bucket.end_step + 1 == old.macro_step
+                        && bucket.era == old.era
+                        && (water == 0
+                            || bucket.water_per_col == 0
+                            || water.signum() == bucket.water_per_col.signum())
+                        && cursors.binary_search(&bucket.end_step).is_err()
+                });
+                if !append {
+                    self.archived_buckets.push(ArchivedFluxRecord {
+                        start_step: old.macro_step,
+                        end_step: old.macro_step,
+                        era: old.era,
+                        acid: 0.0,
+                        salt: 0.0,
+                        flood_peak: 0.0,
+                        flood_exposure: 0.0,
+                        ph: 0.0,
+                        fertility: 0.0,
+                        salinity: 0.0,
+                        charge: 0.0,
+                        water_per_col: 0,
+                        settled_water_ul: 0,
+                    });
+                }
+                self.archived_buckets.last_mut().unwrap().append(old);
+                self.discarded_through = old.macro_step;
+            }
         }
         self.records.push(rec);
     }
@@ -327,11 +397,11 @@ pub struct MacroRegion {
 
     // Conserved L3 reservoirs (exact i64 accounting)
     pub water_vapor_ul: i64,
-    /// Water exchanged between atmosphere and dormant chunks pending lazy realization (exact conservation).
+    /// Condensed water awaiting placement or re-evaporation (exact conservation).
     pub pending_surface_water_ul: i64,
-    /// Rainwater still in pending that has not accumulated to a full per-column increment.
+    /// Rainwater eligible for the next basin-wide settlement.
     pub precipitation_remainder_ul: i64,
-    /// Unissued surface evaporation demand. This is a request, not a water reservoir.
+    /// Accumulated evaporation demand for the current day, in microliters.
     pub evaporation_remainder_ul: i64,
     pub mineral_dust_units: i64,
     pub surface_charge_uc: i64,
@@ -433,6 +503,10 @@ pub struct WorldState {
     pub l1_chunks: Vec<FieldChunkSoA>,
     pub regions: Vec<MacroRegion>,
     pub topology: WorldTopology,
+    /// Original column elevations used to keep a stable owner for surface replay.
+    pub surface_reference_height: Vec<u16>,
+    /// Undeposited salt supplied by arid evaporation, indexed by column.
+    pub surface_salt_inventory: Vec<f64>,
     /// Baseline conserved total water recorded at genesis (surface fluid + vapor + pending).
     pub initial_world_water_ul: i64,
 }
@@ -441,6 +515,7 @@ impl WorldState {
     pub fn new_empty(config: WorldConfig, seed: MasterSeed, worldgen_version: u32) -> Self {
         let total_chunks = config.dimensions.total_chunks();
         let ds = config.field_downsample;
+        let width = config.dimensions.width_cells();
         let l0_chunks = (0..total_chunks)
             .map(|_| TerrainChunkSoA::new_air())
             .collect();
@@ -455,6 +530,8 @@ impl WorldState {
             l1_chunks,
             regions: Vec::new(),
             topology: WorldTopology::default(),
+            surface_reference_height: Vec::new(),
+            surface_salt_inventory: vec![0.0; width],
             initial_world_water_ul: 0,
         }
     }
@@ -623,11 +700,27 @@ impl WorldState {
             ch.sleep.flux_mask_dirty = true;
             // Wake neighboring chunks if on border
             self.wake_neighbors_if_border(cc, lx, ly);
+            if self.topology.surface_height.get(cell.x as usize) == Some(&(cell.y as u16))
+                && next_mat.is_air()
+            {
+                self.refresh_surface_height(cell.x as usize, cell.y as usize);
+            }
             true
         } else {
             ch.solid_integrity[li] = (cur - total_dmg) as u16;
             false
         }
+    }
+
+    /// Recompute a column top after removing its exposed solid.
+    pub(crate) fn refresh_surface_height(&mut self, x: usize, ceiling: usize) {
+        self.topology.surface_height[x] = (0..ceiling)
+            .rev()
+            .find(|&y| {
+                self.get_material(CellCoord::new(x as i32, y as i32))
+                    .is_solid()
+            })
+            .unwrap_or(0) as u16;
     }
 
     pub fn wake_neighbors_if_border(&mut self, cc: ChunkCoord, lx: usize, ly: usize) {
@@ -745,7 +838,10 @@ impl WorldState {
     pub fn estimated_memory_bytes(&self) -> usize {
         let l0: usize = self.l0_chunks.iter().map(|c| c.estimated_bytes()).sum();
         let l1: usize = self.l1_chunks.iter().map(|c| c.estimated_bytes()).sum();
-        let topo = self.topology.surface_height.capacity() * 2
+        let topo = (self.topology.surface_height.capacity()
+            + self.surface_reference_height.capacity())
+            * 2
+            + self.surface_salt_inventory.capacity() * 8
             + self.topology.aquifer_y.capacity() * 2
             + self.topology.ruin_anchors.capacity() * std::mem::size_of::<RuinGeologicalAnchor>();
         let reg: usize = self
@@ -754,6 +850,8 @@ impl WorldState {
             .map(|r| {
                 std::mem::size_of::<MacroRegion>()
                     + r.flux_history.records.capacity() * std::mem::size_of::<MacroFluxRecord>()
+                    + r.flux_history.archived_buckets.capacity()
+                        * std::mem::size_of::<ArchivedFluxRecord>()
             })
             .sum();
         l0 + l1 + topo + reg + std::mem::size_of::<Self>()
@@ -784,7 +882,7 @@ impl WorldState {
         let f = &self.l1_chunks[ci];
         let fi = f.idx(fx, fy);
         Some((
-            PhScaled(f.ph_scaled[fi]),
+            PhScaled(((f.ph_milli[fi] + 50) / 100) as u8),
             FertilityUnits(f.fertility[fi]),
             SalinityPpm(f.salinity[fi]),
             DeciKelvin(f.temperature_dk[fi]),

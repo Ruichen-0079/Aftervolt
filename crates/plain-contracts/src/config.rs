@@ -4,9 +4,9 @@ use crate::coords::{FieldDownsample, WorldDimensions};
 use crate::time::ClockConfig;
 
 /// Current generator algorithm version (F8: frozen per save baseline).
-pub const CURRENT_WORLDGEN_VERSION: u32 = 2;
+pub const CURRENT_WORLDGEN_VERSION: u32 = 3;
 /// Current persistence schema version (F8: explicit migration chain).
-pub const CURRENT_SCHEMA_VERSION: u32 = 2;
+pub const CURRENT_SCHEMA_VERSION: u32 = 3;
 
 /// Configuration for the non-uniform, non-linear 4-era macro cycle.
 /// Confirmed baseline: default full cycle = 1220 game days, non-uniform era durations,

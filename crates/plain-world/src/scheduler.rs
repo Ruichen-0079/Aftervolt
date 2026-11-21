@@ -67,9 +67,11 @@ impl ProfilerState {
 /// multi-rate scheduler (Fine/Meso/Macro), and built-in subsystem profiler.
 pub struct WorldSimulation {
     pub world: WorldState,
-    pub observers: Vec<ObserverCamera>,
+    pub dev_cameras: Vec<ObserverCamera>,
+    simulation_anchors: Vec<(u8, ViewportRect)>,
+    ready_active_mask: Vec<bool>,
     pub profiler: ProfilerState,
-    /// Reusable bitmask marking LOD-0 active chunks across the union of all observers.
+    /// Reusable bitmask marking LOD-0 active chunks across the union of all simulation anchors.
     active_chunk_mask: Vec<bool>,
     pub active_lod0_count: u32,
 }
@@ -79,22 +81,24 @@ impl WorldSimulation {
         let total = world.config.dimensions.total_chunks();
         let mut sim = Self {
             world,
-            observers: Vec::new(),
+            dev_cameras: Vec::new(),
+            simulation_anchors: Vec::new(),
+            ready_active_mask: vec![false; total],
             profiler: ProfilerState::default(),
             active_chunk_mask: vec![false; total],
             active_lod0_count: 0,
         };
-        // Default observer camera centered on the middle basin at surface height
+        // Default simulation anchor centered on the middle basin at surface height
         let w = sim.world.width_cells() as i32;
         let mid_x = w / 2;
         let mid_y = sim
             .world
-            .topology
-            .surface_height
+            .surface_reference_height
             .get(mid_x as usize)
+            .or_else(|| sim.world.topology.surface_height.get(mid_x as usize))
             .copied()
             .unwrap_or((sim.world.height_cells() / 2) as u16) as i32;
-        sim.set_dev_camera(
+        sim.set_simulation_anchor(
             0,
             ViewportRect {
                 min_x: (mid_x - 256).max(0),
@@ -107,16 +111,32 @@ impl WorldSimulation {
     }
 
     pub fn set_dev_camera(&mut self, id: u8, viewport: ViewportRect) {
-        if let Some(cam) = self.observers.iter_mut().find(|c| c.id == id) {
+        if let Some(cam) = self.dev_cameras.iter_mut().find(|c| c.id == id) {
             cam.viewport = viewport;
         } else {
-            self.observers.push(ObserverCamera { id, viewport });
+            self.dev_cameras.push(ObserverCamera { id, viewport });
+        }
+    }
+
+    pub fn remove_dev_camera(&mut self, id: u8) {
+        self.dev_cameras.retain(|c| c.id != id);
+    }
+
+    pub fn set_simulation_anchor(&mut self, id: u8, viewport: ViewportRect) {
+        if let Some((_, current)) = self
+            .simulation_anchors
+            .iter_mut()
+            .find(|(key, _)| *key == id)
+        {
+            *current = viewport;
+        } else {
+            self.simulation_anchors.push((id, viewport));
         }
         self.rebuild_active_mask();
     }
 
-    pub fn remove_dev_camera(&mut self, id: u8) {
-        self.observers.retain(|c| c.id != id);
+    pub fn remove_simulation_anchor(&mut self, id: u8) {
+        self.simulation_anchors.retain(|&(key, _)| key != id);
         self.rebuild_active_mask();
     }
 
@@ -140,13 +160,13 @@ impl WorldSimulation {
         let pad = self.world.config.active_lod0_padding_chunks;
         let mut count = 0u32;
 
-        for cam in &self.observers {
+        for &(_, viewport) in &self.simulation_anchors {
             let (min_c, max_c) = viewport_chunk_bounds(
                 &self.world,
-                cam.viewport.min_x,
-                cam.viewport.min_y,
-                cam.viewport.max_x,
-                cam.viewport.max_y,
+                viewport.min_x,
+                viewport.min_y,
+                viewport.max_x,
+                viewport.max_y,
                 pad,
             );
             for cy in min_c.cy..=max_c.cy {
@@ -161,6 +181,18 @@ impl WorldSimulation {
             }
         }
         self.active_lod0_count = count;
+    }
+
+    fn refresh_ready_mask(&mut self) {
+        let step = self.world.clock.macro_step.0;
+        for ((ready, &active), chunk) in self
+            .ready_active_mask
+            .iter_mut()
+            .zip(&self.active_chunk_mask)
+            .zip(&self.world.l0_chunks)
+        {
+            *ready = active && chunk.last_realized_macro_step == step;
+        }
     }
 
     /// Force all chunks active (used in Q3 full-world worst-case stress benchmarks).
@@ -190,25 +222,26 @@ impl WorldSimulation {
         // 1. Lazy catch-up for any active LOD-0 chunk lagging behind current macro step (budgeted)
         let t0 = Instant::now();
         catch_up_active_chunks(&mut self.world, &self.active_chunk_mask, 16);
+        self.refresh_ready_mask();
         timings.catchup_us = t0.elapsed().as_micros() as u64;
 
         // 2. Parallel 4-phase conserved cellular fluid pass on active awake chunks
         let t1 = Instant::now();
         let tick_parity = self.world.clock.tick.0;
-        step_fluid_active_chunks(&mut self.world, &self.active_chunk_mask, tick_parity);
+        step_fluid_active_chunks(&mut self.world, &self.ready_active_mask, tick_parity);
         timings.fluid_us = t1.elapsed().as_micros() as u64;
 
         // 3. L1 local physical electric field solver on configured cadence (e.g. 15 Hz or 20 Hz)
         if fire_electric {
             let t2 = Instant::now();
-            solve_local_electric_field(&mut self.world, &self.active_chunk_mask);
+            solve_local_electric_field(&mut self.world, &self.ready_active_mask);
             timings.electric_us = t2.elapsed().as_micros() as u64;
         }
 
         // 4. L1 physicochemical & 4-microbe wall-aware fields on meso cadence
         if fire_meso {
             let t3 = Instant::now();
-            step_l1_fields(&mut self.world, &self.active_chunk_mask);
+            step_l1_fields(&mut self.world, &self.ready_active_mask);
             timings.fields_us = t3.elapsed().as_micros() as u64;
         }
 
@@ -244,8 +277,9 @@ impl WorldSimulation {
             );
             timings.catchup_us = t_cu.elapsed().as_micros() as u64;
 
+            self.refresh_ready_mask();
             let t_ef = Instant::now();
-            solve_local_electric_field(&mut self.world, &self.active_chunk_mask);
+            solve_local_electric_field(&mut self.world, &self.ready_active_mask);
             timings.electric_us = t_ef.elapsed().as_micros() as u64;
         }
 

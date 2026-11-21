@@ -19,7 +19,7 @@ pub fn world_state_hash(world: &WorldState) -> [u8; 32] {
         };
     }
 
-    h.update(b"plain-world-state-hash-v2:");
+    h.update(b"plain-world-state-hash-v3:");
     h.update(&world.seed.0);
     let config = &world.config;
     ints!(
@@ -93,8 +93,10 @@ pub fn world_state_hash(world: &WorldState) -> [u8; 32] {
     len!(world.l1_chunks);
     for l1 in &world.l1_chunks {
         h.update(&[l1.axis_len]);
-        len!(l1.ph_scaled);
-        h.update(&l1.ph_scaled);
+        len!(l1.ph_milli);
+        for &ph in &l1.ph_milli {
+            ints!(ph);
+        }
         len!(l1.fertility);
         for &v in &l1.fertility {
             h.update(&v.to_le_bytes());
@@ -156,9 +158,35 @@ pub fn world_state_hash(world: &WorldState) -> [u8; 32] {
             r.dust_saturation,
             r.flower_sea_suitability,
         );
+        len!(r.flux_history.archived_buckets);
+        for bucket in &r.flux_history.archived_buckets {
+            ints!(
+                bucket.start_step,
+                bucket.end_step,
+                bucket.water_per_col,
+                bucket.settled_water_ul
+            );
+            bytes!(bucket.era);
+            floats!(bucket.flood_peak);
+            for value in [
+                bucket.acid,
+                bucket.salt,
+                bucket.flood_exposure,
+                bucket.ph,
+                bucket.fertility,
+                bucket.salinity,
+                bucket.charge,
+            ] {
+                ints!(canonical_f64(value));
+            }
+        }
         len!(r.flux_history.records);
         for record in &r.flux_history.records {
-            ints!(record.macro_step, record.net_water_delta_per_col);
+            ints!(
+                record.macro_step,
+                record.net_water_delta_per_col,
+                record.settled_water_ul
+            );
             bytes!(record.era, record.weather);
             floats!(
                 record.acid_erosion_impulse,
@@ -170,6 +198,16 @@ pub fn world_state_hash(world: &WorldState) -> [u8; 32] {
                 record.ambient_charge_v,
             );
         }
+    }
+
+    len!(world.surface_reference_height);
+    for &height in &world.surface_reference_height {
+        ints!(height);
+    }
+
+    len!(world.surface_salt_inventory);
+    for &salt in &world.surface_salt_inventory {
+        ints!(canonical_f64(salt));
     }
 
     let topo = &world.topology;
@@ -241,6 +279,16 @@ fn canonical_f32(value: f32) -> u32 {
         0
     } else if value.is_nan() {
         0x7fc0_0000
+    } else {
+        value.to_bits()
+    }
+}
+
+fn canonical_f64(value: f64) -> u64 {
+    if value == 0.0 {
+        0
+    } else if value.is_nan() {
+        f64::NAN.to_bits()
     } else {
         value.to_bits()
     }

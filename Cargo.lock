@@ -2612,6 +2612,7 @@ dependencies = [
 name = "plain-observer"
 version = "0.1.0"
 dependencies = [
+ "ab_glyph",
  "clap",
  "eframe",
  "egui",
@@ -2620,6 +2621,7 @@ dependencies = [
  "plain-persist",
  "plain-world",
  "plain-worldgen",
+ "ttf-parser",
 ]
 
 [[package]]

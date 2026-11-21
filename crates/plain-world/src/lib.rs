@@ -12,6 +12,7 @@ pub mod climate;
 pub mod electric;
 pub mod fields;
 pub mod fluid;
+mod halo;
 pub mod scheduler;
 pub mod spatial;
 #[cfg(feature = "dev-telemetry")]
@@ -20,8 +21,8 @@ pub mod telemetry;
 pub use electric::ElectricSample;
 pub use scheduler::{ObserverCamera, ProfilerState, WorldSimulation};
 pub use spatial::{
-    BasinRole, ChunkSleepFlags, DarkRiverEdge, DirtyRect, FieldChunkSoA, MacroFluxRecord,
-    MacroRegion, RegionalMacroFluxHistory, RuinAnchorKind, RuinGeologicalAnchor,
+    ArchivedFluxRecord, BasinRole, ChunkSleepFlags, DarkRiverEdge, DirtyRect, FieldChunkSoA,
+    MacroFluxRecord, MacroRegion, RegionalMacroFluxHistory, RuinAnchorKind, RuinGeologicalAnchor,
     SinkholeDescriptor, TerrainChunkSoA, WorldState, WorldTopology, FLUX_BLOCK_E, FLUX_BLOCK_N,
     FLUX_BLOCK_S, FLUX_BLOCK_W,
 };

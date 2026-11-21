@@ -4,6 +4,8 @@ use plain_world::spatial::CELL_FLAG_RUIN_ANCHOR;
 use plain_world::{BasinRole, RuinAnchorKind, RuinGeologicalAnchor, WorldState};
 use rand_core::RngCore;
 
+use crate::underground::is_open_sinkhole_cell;
+
 /// Step 5: Embed scattered, low-volume Ruin Geological Anchors (~10% ceiling, preserving ~90% natural world).
 ///
 /// Stage 1 strictly reserves:
@@ -190,6 +192,9 @@ fn build_rectangular_ruin_shell(
     for y in min_y..=max_y {
         for x in min_x..=max_x {
             let cell = CellCoord::new(x, y);
+            if is_open_sinkhole_cell(world, cell) {
+                continue;
+            }
             let on_wall = x < min_x + wall_t
                 || x > max_x - wall_t
                 || y < min_y + wall_t

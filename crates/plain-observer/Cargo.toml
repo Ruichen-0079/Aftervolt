@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+ab_glyph = "0.2"
 clap.workspace = true
 eframe.workspace = true
 egui.workspace = true
@@ -13,6 +14,7 @@ plain-contracts = { path = "../plain-contracts", features = ["dev-telemetry"] }
 plain-persist = { path = "../plain-persist" }
 plain-world = { path = "../plain-world", features = ["dev-telemetry"] }
 plain-worldgen = { path = "../plain-worldgen" }
+ttf-parser = { version = "0.25", default-features = false, features = ["std"] }
 
 [lints]
 workspace = true

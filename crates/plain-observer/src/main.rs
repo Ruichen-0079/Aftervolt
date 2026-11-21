@@ -321,6 +321,7 @@ fn run_verify_persistence(
     let t_load1 = Instant::now();
     let loaded_after = store.load_world()?;
     let load_inc_ms = t_load1.elapsed().as_secs_f64() * 1000.0;
+    store.close()?;
     let hash_loaded_after = world_state_hash(&loaded_after);
     assert_eq!(
         hash_after_sim, hash_loaded_after,

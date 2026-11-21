@@ -129,7 +129,7 @@ pub fn initialize_fields_and_climate(world: &mut WorldState) {
                 } else if role == BasinRole::RidgePlateau {
                     ph -= 6.0;
                 }
-                l1.ph_scaled[fi] = ph.clamp(35.0, 112.0) as u8;
+                l1.ph_milli[fi] = (ph.clamp(35.0, 112.0) * 100.0).round() as u16;
 
                 // Initial fertility (ElectrolyteSaltBasin naturally rich in mineral electrolytes)
                 let base_fert = match role {

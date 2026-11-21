@@ -49,13 +49,28 @@ pub fn validate_world(world: &WorldState) -> WorldValidationReport {
     });
 
     // Gate 2: Topographic relief contrast (guarantees staggered highlands vs lowlands)
-    let min_sy = world.topology.surface_height.iter().copied().min().unwrap_or(0);
-    let max_sy = world.topology.surface_height.iter().copied().max().unwrap_or(0);
+    let min_sy = world
+        .topology
+        .surface_height
+        .iter()
+        .copied()
+        .min()
+        .unwrap_or(0);
+    let max_sy = world
+        .topology
+        .surface_height
+        .iter()
+        .copied()
+        .max()
+        .unwrap_or(0);
     let relief_frac = ((max_sy.saturating_sub(min_sy)) as f32) / (h.max(1) as f32);
     checks.push(ValidationCheck {
         name: "surface_relief_contrast".into(),
         passed: relief_frac >= 0.18,
-        detail: format!("min_y={min_sy}, max_y={max_sy}, relief={:.1}%", relief_frac * 100.0),
+        detail: format!(
+            "min_y={min_sy}, max_y={max_sy}, relief={:.1}%",
+            relief_frac * 100.0
+        ),
     });
 
     // Gate 3: Expansive natural Electrolyte Flower Sea habitat (strictly ruin-independent)
@@ -90,7 +105,7 @@ pub fn validate_world(world: &WorldState) -> WorldValidationReport {
         ),
     });
 
-    // Gate 5: True coarse-grid BFS confirming open/water connectivity from surface down sinkhole to deep BlackWater
+    // Gate 5: Exact four-neighbor BFS confirming open/water connectivity from surface down sinkhole to deep BlackWater
     let sinkhole_connected = verify_surface_to_blackwater_bfs(world);
     checks.push(ValidationCheck {
         name: "sinkhole_to_blackwater_connectivity".into(),
@@ -134,8 +149,8 @@ pub fn validate_world(world: &WorldState) -> WorldValidationReport {
     // Gate 8: L1 field validity (no NaN/Inf in electric potential, valid pH & temperatures)
     let mut bad_l1 = 0u64;
     for l1 in &world.l1_chunks {
-        for i in 0..l1.ph_scaled.len() {
-            if l1.ph_scaled[i] > 140
+        for i in 0..l1.ph_milli.len() {
+            if l1.ph_milli[i] > 14_000
                 || l1.temperature_dk[i] < 1000
                 || !l1.electric_potential[i].is_finite()
             {
@@ -153,55 +168,137 @@ pub fn validate_world(world: &WorldState) -> WorldValidationReport {
     WorldValidationReport { passed, checks }
 }
 
-/// Perform a 4-cell-strided BFS starting from the top of each carved sinkhole shaft to verify
-/// an unobstructed non-solid shaft/cavern passage reaching actual deep `FluidKind::BlackWater`.
+/// Search exact AIR cells from the sinkhole mouths to the deep river.
 fn verify_surface_to_blackwater_bfs(world: &WorldState) -> bool {
-    let stride = 4i32;
-    let gw = (world.width_cells() as i32) / stride;
-    let gh = (world.height_cells() as i32) / stride;
-    let mut visited = vec![false; (gw * gh) as usize];
-    let mut queue = VecDeque::new();
+    let width = world.width_cells();
+    let height = world.height_cells();
+    let starts: Vec<_> = world
+        .topology
+        .sinkholes
+        .iter()
+        .map(|sh| CellCoord::new(sh.x_center, sh.top_y))
+        .filter(|&cell| world.config.dimensions.contains_cell(cell))
+        .collect();
 
-    for sh in &world.topology.sinkholes {
-        let gx = (sh.x_center / stride).clamp(1, gw - 2);
-        let gy = ((sh.top_y - 2) / stride).clamp(1, gh - 2);
-        let idx = (gy * gw + gx) as usize;
-        if !visited[idx] {
-            visited[idx] = true;
-            queue.push_back((gx, gy));
-        }
-    }
-
-    let dirs = [(0, -1), (0, 1), (-1, 0), (1, 0)];
-    while let Some((gx, gy)) = queue.pop_front() {
-        let cx = gx * stride + stride / 2;
-        let cy = gy * stride + stride / 2;
-        let cell = CellCoord::new(cx, cy);
-        let (fk, fv) = world.get_fluid(cell);
-        if fk == FluidKind::BlackWater && fv > 1000 {
+    for &start in &starts {
+        let x = start.x as usize;
+        if underground_bfs(
+            world,
+            &[start],
+            x.saturating_sub(40),
+            (x + 41).min(width),
+            height,
+        ) {
             return true;
         }
-        for (dx, dy) in dirs {
-            let nx = gx + dx;
-            let ny = gy + dy;
-            if nx <= 0 || ny <= 0 || nx >= gw - 1 || ny >= gh - 1 {
-                continue;
+    }
+    !starts.is_empty() && underground_bfs(world, &starts, 0, width, height)
+}
+
+fn underground_bfs(
+    world: &WorldState,
+    starts: &[CellCoord],
+    left: usize,
+    right: usize,
+    height: usize,
+) -> bool {
+    let span = right - left;
+    let mut seen = vec![false; span * height];
+    let mut queue = VecDeque::new();
+    let mut visit = |x: usize, y: usize, queue: &mut VecDeque<(usize, usize)>| {
+        if y > usize::from(world.topology.surface_height[x]) + 10 {
+            return;
+        }
+        let index = y * span + x - left;
+        if !seen[index] {
+            seen[index] = true;
+            if world.get_material(CellCoord::new(x as i32, y as i32)) == MaterialId::AIR {
+                queue.push_back((x, y));
             }
-            let nidx = (ny * gw + nx) as usize;
-            if visited[nidx] {
-                continue;
-            }
-            // Passable if at least one cell in the 2x2 center of the strided node is Air
-            let ncx = nx * stride + stride / 2;
-            let ncy = ny * stride + stride / 2;
-            let passable = world.get_material(CellCoord::new(ncx, ncy)) == MaterialId::AIR
-                || world.get_material(CellCoord::new(ncx + 1, ncy)) == MaterialId::AIR
-                || world.get_material(CellCoord::new(ncx, ncy + 1)) == MaterialId::AIR;
-            if passable {
-                visited[nidx] = true;
-                queue.push_back((nx, ny));
-            }
+        }
+    };
+    for cell in starts {
+        visit(cell.x as usize, cell.y as usize, &mut queue);
+    }
+    while let Some((x, y)) = queue.pop_front() {
+        let (kind, volume) = world.get_fluid(CellCoord::new(x as i32, y as i32));
+        if kind == FluidKind::BlackWater && volume > 1000 {
+            return true;
+        }
+        if y > 0 {
+            visit(x, y - 1, &mut queue);
+        }
+        if x > left {
+            visit(x - 1, y, &mut queue);
+        }
+        if x + 1 < right {
+            visit(x + 1, y, &mut queue);
+        }
+        if y + 1 < height {
+            visit(x, y + 1, &mut queue);
         }
     }
     false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use plain_contracts::{MasterSeed, WorldConfig, WorldDimensions};
+    use plain_world::SinkholeDescriptor;
+
+    #[test]
+    fn exact_bfs_reaches_the_aquifer_on_large_candidates() {
+        for config in [
+            WorldConfig::candidate_6144x2048(),
+            WorldConfig::preset_8192x2048(),
+        ] {
+            let (world, _, _) =
+                crate::generate_valid_world(config, MasterSeed::from_u64(404), 4).unwrap();
+            let start = std::time::Instant::now();
+            assert!(verify_surface_to_blackwater_bfs(&world));
+            eprintln!(
+                "{}x{} exact BFS: {:.3} ms",
+                world.width_cells(),
+                world.height_cells(),
+                start.elapsed().as_secs_f64() * 1000.0
+            );
+        }
+    }
+
+    #[test]
+    fn one_cell_basalt_plate_seals_the_sinkhole() {
+        let mut config = WorldConfig::preset_ci_1024x512();
+        config.dimensions = WorldDimensions::from_chunks(1, 1);
+        let mut world = WorldState::new_empty(config, MasterSeed::from_u64(1), 1);
+        world.topology.surface_height = vec![50; 64];
+        for y in 0..=50 {
+            for x in 0..64 {
+                if !(30..=32).contains(&x) {
+                    world.set_solid_unchecked_gen(CellCoord::new(x, y), MaterialId::BASALT_BEDROCK);
+                }
+            }
+        }
+        world.topology.sinkholes.push(SinkholeDescriptor {
+            region_id: plain_contracts::RegionId(0),
+            x_center: 31,
+            top_y: 56,
+            bottom_y: 5,
+            mean_radius: 1,
+        });
+        world.set_fluid_gen(CellCoord::new(31, 7), FluidKind::BlackWater, 9_000);
+        let passes = |world: &WorldState| {
+            validate_world(world)
+                .checks
+                .iter()
+                .find(|check| check.name == "sinkhole_to_blackwater_connectivity")
+                .unwrap()
+                .passed
+        };
+        assert!(passes(&world));
+        for x in 30..=32 {
+            world.set_solid_unchecked_gen(CellCoord::new(x, 29), MaterialId::BASALT_BEDROCK);
+        }
+        assert!(!passes(&world));
+    }
 }
