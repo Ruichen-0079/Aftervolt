@@ -8,7 +8,7 @@ use rayon::prelude::*;
 
 use crate::electric::sample_electric_gradient;
 use crate::scheduler::WorldSimulation;
-use crate::spatial::{WorldState, CELL_FLAG_DORMANT_BANK, CELL_FLAG_RUIN_ANCHOR};
+use crate::spatial::{L1CellSample, WorldState, CELL_FLAG_DORMANT_BANK, CELL_FLAG_RUIN_ANCHOR};
 
 impl DevTelemetryPort for WorldSimulation {
     fn render_world_overview(
@@ -88,8 +88,7 @@ impl DevTelemetryPort for WorldSimulation {
         let fkind = FluidKind::from_u8(ch.fluid_kind[li]);
         let fvol = ch.fluid_volume[li];
 
-        let (ph, fertility, salinity, temperature, microbes, e_pot, _cond, flux_mask) =
-            self.world.sample_l1_at_cell(cell)?;
+        let sample = self.world.sample_l1_at_cell(cell)?;
         let world_pos = cell.to_world_meters_center(self.world.config.meters_per_cell);
         let esample = sample_electric_gradient(&self.world, world_pos, false);
 
@@ -107,18 +106,18 @@ impl DevTelemetryPort for WorldSimulation {
             integrity: ch.solid_integrity[li],
             fluid_kind: fkind,
             fluid_volume: fvol,
-            ph,
-            fertility,
-            salinity,
-            temperature,
-            microbe_saprotroph: microbes[0],
-            microbe_conductive: microbes[1],
-            microbe_halophile: microbes[2],
-            microbe_ferro: microbes[3],
-            electric_potential: e_pot,
+            ph: sample.ph,
+            fertility: sample.fertility,
+            salinity: sample.salinity,
+            temperature: sample.temperature,
+            microbe_saprotroph: sample.microbes[0],
+            microbe_conductive: sample.microbes[1],
+            microbe_halophile: sample.microbes[2],
+            microbe_ferro: sample.microbes[3],
+            electric_potential: sample.electric_potential,
             electric_grad_x: esample.grad_x,
             electric_grad_y: esample.grad_y,
-            flux_block_mask: flux_mask,
+            flux_block_mask: sample.flux_block_mask,
             chunk_sleeping: ch.sleep.fluid_sleeping,
             chunk_last_macro_step: ch.last_realized_macro_step,
             era: region.era,
@@ -314,7 +313,7 @@ fn sample_overlay_rgba(
             heat_ramp_inferno(norm)
         }
         OverlayKind::PhField => {
-            let Some((ph, _, _, _, _, _, _, _)) = world.sample_l1_at_cell(cell) else {
+            let Some(L1CellSample { ph, .. }) = world.sample_l1_at_cell(cell) else {
                 return [0, 0, 0];
             };
             // Red = acidic (pH 3), Green = neutral (pH 7), Blue/Purple = alkaline (pH 11)
@@ -332,67 +331,68 @@ fn sample_overlay_rgba(
             rgb
         }
         OverlayKind::FertilityField => {
-            let Some((_, fert, _, _, _, _, _, _)) = world.sample_l1_at_cell(cell) else {
+            let Some(L1CellSample { fertility, .. }) = world.sample_l1_at_cell(cell) else {
                 return [0, 0, 0];
             };
-            let t = fert.0 as f32 / 65_535.0;
+            let t = fertility.0 as f32 / 65_535.0;
             let base = [(40.0 + 45.0 * (1.0 - t)) as u8, (35.0 + 210.0 * t) as u8, (30.0 + 60.0 * t) as u8];
             if mat.is_air() && fvol == 0 { [base[0] / 3, base[1] / 3, base[2] / 3] } else { base }
         }
         OverlayKind::SalinityField => {
-            let Some((_, _, sal, _, _, _, _, _)) = world.sample_l1_at_cell(cell) else {
+            let Some(L1CellSample { salinity, .. }) = world.sample_l1_at_cell(cell) else {
                 return [0, 0, 0];
             };
-            let t = sal.0 as f32 / 65_535.0;
+            let t = salinity.0 as f32 / 65_535.0;
             let v = (30.0 + 225.0 * t) as u8;
             [v, v, (25.0 + 195.0 * t) as u8]
         }
         OverlayKind::TemperatureField => {
-            let Some((_, _, _, temp, _, _, _, _)) = world.sample_l1_at_cell(cell) else {
+            let Some(L1CellSample { temperature, .. }) = world.sample_l1_at_cell(cell) else {
                 return [0, 0, 0];
             };
-            let t = ((temp.0 as f32 - 2750.0) / 650.0).clamp(0.0, 1.0);
+            let t = ((temperature.0 as f32 - 2750.0) / 650.0).clamp(0.0, 1.0);
             heat_ramp_inferno(t)
         }
         OverlayKind::MicrobeSaprotroph => {
-            let Some((_, _, _, _, m, _, _, _)) = world.sample_l1_at_cell(cell) else {
+            let Some(L1CellSample { microbes, .. }) = world.sample_l1_at_cell(cell) else {
                 return [0, 0, 0];
             };
-            let t = m[0] as f32 / 255.0;
+            let t = microbes[0] as f32 / 255.0;
             [(30.0 + 190.0 * t) as u8, (25.0 + 145.0 * t) as u8, (20.0 + 40.0 * t) as u8]
         }
         OverlayKind::MicrobeConductive => {
-            let Some((_, _, _, _, m, _, _, _)) = world.sample_l1_at_cell(cell) else {
+            let Some(L1CellSample { microbes, .. }) = world.sample_l1_at_cell(cell) else {
                 return [0, 0, 0];
             };
-            let t = m[1] as f32 / 255.0;
+            let t = microbes[1] as f32 / 255.0;
             [(24.0 + 200.0 * t) as u8, (22.0 + 100.0 * t) as u8, (25.0 + 45.0 * t) as u8]
         }
         OverlayKind::MicrobeHalophile => {
-            let Some((_, _, _, _, m, _, _, _)) = world.sample_l1_at_cell(cell) else {
+            let Some(L1CellSample { microbes, .. }) = world.sample_l1_at_cell(cell) else {
                 return [0, 0, 0];
             };
-            let t = m[2] as f32 / 255.0;
+            let t = microbes[2] as f32 / 255.0;
             [(20.0 + 55.0 * t) as u8, (25.0 + 205.0 * t) as u8, (35.0 + 195.0 * t) as u8]
         }
         OverlayKind::MicrobeFerro => {
-            let Some((_, _, _, _, m, _, _, _)) = world.sample_l1_at_cell(cell) else {
+            let Some(L1CellSample { microbes, .. }) = world.sample_l1_at_cell(cell) else {
                 return [0, 0, 0];
             };
-            let t = m[3] as f32 / 255.0;
+            let t = microbes[3] as f32 / 255.0;
             [(30.0 + 185.0 * t) as u8, (20.0 + 65.0 * t) as u8, (30.0 + 135.0 * t) as u8]
         }
         OverlayKind::ElectricPotential => {
-            let Some((_, _, _, _, _, v, cond, _)) = world.sample_l1_at_cell(cell) else {
+            let Some(L1CellSample { electric_potential, .. }) = world.sample_l1_at_cell(cell) else {
                 return [0, 0, 0];
             };
-            let t = ((v + 40.0) / 280.0).clamp(0.0, 1.0);
-            let c = (cond as f32 / 1200.0).clamp(0.0, 1.0);
-            [
-                (20.0 + 180.0 * t) as u8,
-                (25.0 + 140.0 * c + 70.0 * t) as u8,
-                (40.0 + 215.0 * t.max(c * 0.7)) as u8,
-            ]
+            let t = ((electric_potential + 40.0) / 280.0).clamp(0.0, 1.0);
+            [(20.0 + 180.0 * t) as u8, (25.0 + 70.0 * t) as u8, (40.0 + 215.0 * t) as u8]
+        }
+        OverlayKind::ConductivityField => {
+            let Some(L1CellSample { conductivity, .. }) = world.sample_l1_at_cell(cell) else {
+                return [0, 0, 0];
+            };
+            heat_ramp_inferno(f32::from(conductivity) / 1500.0)
         }
         OverlayKind::ChunkActivityDebug => {
             let is_border = cell.x.rem_euclid(CHUNK_SIZE as i32) == 0
@@ -412,15 +412,15 @@ fn sample_overlay_rgba(
             }
         }
         OverlayKind::BiomeSuitability => {
-            let Some((ph, fert, sal, _, _, _, _, _)) = world.sample_l1_at_cell(cell) else {
+            let Some(L1CellSample { ph, fertility, salinity, .. }) = world.sample_l1_at_cell(cell) else {
                 return [0, 0, 0];
             };
             if mat.is_air() && fvol == 0 {
                 return [14, 18, 26];
             }
             // Highlight Electrolyte Flower Sea suitability (rich fertility + moderate/high salinity + moderate pH)
-            let f_score = (fert.0 as f32 / 40_000.0).clamp(0.0, 1.0);
-            let s_score = (sal.0 as f32 / 28_000.0).clamp(0.0, 1.0);
+            let f_score = (fertility.0 as f32 / 40_000.0).clamp(0.0, 1.0);
+            let s_score = (salinity.0 as f32 / 28_000.0).clamp(0.0, 1.0);
             let ph_score = (1.0 - (ph.0 as f32 - 70.0).abs() / 35.0).clamp(0.0, 1.0);
             let flower_suit = f_score * s_score * ph_score;
             if flower_suit > 0.25 {

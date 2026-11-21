@@ -45,46 +45,33 @@ pub fn solve_local_electric_field(world: &mut WorldState, active_mask: &[bool]) 
         }
     }
 
-    // Precompute regional atmospheric forcing per chunk column
-    let col_forcing: Vec<(f32, WeatherSpectacle)> = (0..chunks_x)
-        .map(|cx| {
-            let x_mid = cx * CHUNK_SIZE + CHUNK_SIZE / 2;
-            let rid = world.region_for_x(x_mid).0 as usize;
-            let r = &world.regions[rid.min(world.regions.len().saturating_sub(1))];
-            let charge_v = (r.charge_index * 120.0)
-                + match r.weather {
-                    WeatherSpectacle::SilentReverseRain => 180.0,
-                    WeatherSpectacle::WanderingBallLightning => 95.0,
-                    WeatherSpectacle::AuroraMagStorm => 70.0,
-                    WeatherSpectacle::RustRedRain => 55.0,
-                    WeatherSpectacle::Calm => 10.0,
-                };
-            (charge_v, r.weather)
-        })
-        .collect();
-
-    let tick_phase = (world.clock.tick.0 as f64) * 0.05;
-
-    // The local lightning forcing is separable across each axis. Evaluate
-    // libm once per row/column instead of repeating the same values per tile.
-    let lightning_x: Vec<Option<Vec<f64>>> = col_forcing
-        .iter()
-        .enumerate()
-        .map(|(cx, &(_, weather))| {
-            (weather == WeatherSpectacle::WanderingBallLightning).then(|| {
-                (0..axis)
-                    .map(|fx| det_sin((cx * CHUNK_SIZE + fx * ds) as f64 * 0.015 + tick_phase))
-                    .collect()
+    let sky_by_column: Vec<_> = (0..chunks_x * axis)
+        .map(|fx| {
+            let id = world.region_for_x(fx * ds + ds / 2).0 as usize;
+            world.regions.get(id).map_or(10.0, |r| {
+                r.charge_index * 120.0
+                    + match r.weather {
+                        WeatherSpectacle::SilentReverseRain => 180.0,
+                        WeatherSpectacle::WanderingBallLightning => 95.0,
+                        WeatherSpectacle::AuroraMagStorm => 70.0,
+                        WeatherSpectacle::RustRedRain => 55.0,
+                        WeatherSpectacle::Calm => 10.0,
+                    }
             })
         })
         .collect();
-    let lightning_y: Vec<f64> = if lightning_x.iter().any(Option::is_some) {
-        (0..chunks_y * axis)
-            .map(|fy| det_cos((fy * ds) as f64 * 0.02 - tick_phase * 0.7))
-            .collect()
-    } else {
-        Vec::new()
-    };
+    let balls = lightning_balls(world);
+    let surface = &world.topology.surface_height;
+    let balls_by_chunk_column: Vec<Vec<_>> = (0..chunks_x)
+        .map(|cx| {
+            let lo = (cx * CHUNK_SIZE) as f32;
+            let hi = lo + CHUNK_SIZE as f32;
+            balls
+                .iter()
+                .filter(|ball| ball.x + ball.radius >= lo && ball.x - ball.radius < hi)
+                .collect()
+        })
+        .collect();
 
     let halos = crate::halo::snapshot(world, active_mask, |l1, i| {
         (l1.electric_potential[i], l1.conductivity[i])
@@ -105,8 +92,7 @@ pub fn solve_local_electric_field(world: &mut WorldState, active_mask: &[bool]) 
                 l0.sleep.dirty_for_save = true;
                 let cx = ci % chunks_x;
                 let cy = ci / chunks_x;
-                let (sky_charge_v, _) = col_forcing[cx];
-                let wave_x = lightning_x[cx].as_deref();
+                let balls = &balls_by_chunk_column[cx];
                 let is_top_chunk = cy + 1 == chunks_y;
                 let is_bottom_chunk = cy == 0;
 
@@ -114,11 +100,12 @@ pub fn solve_local_electric_field(world: &mut WorldState, active_mask: &[bool]) 
                 stencil.resize(axis * axis, ElectricStencil::default());
                 // Each open edge has one static conductance for this solve.
                 for fy in 0..axis {
-                    let wy = cy * CHUNK_SIZE + fy * ds;
+                    let wy = cy * CHUNK_SIZE + fy * ds + ds / 2;
                     for fx in 0..axis {
                         let fi = fy * axis + fx;
                         let lx = fx * ds + ds / 2;
                         let ly = fy * ds + ds / 2;
+                        let wx = cx * CHUNK_SIZE + lx;
                         let mat = MaterialId(l0.solid_material[ly * CHUNK_SIZE + lx]);
                         let mask = l1.flux_block_mask[fi];
                         if fy + 1 < axis
@@ -144,7 +131,7 @@ pub fn solve_local_electric_field(world: &mut WorldState, active_mask: &[bool]) 
                         let mut source = 0.0;
                         if is_top_chunk && fy + 1 == axis {
                             // Sky boundary electrostatic potential
-                            source = sky_charge_v;
+                            source = sky_by_column[cx * axis + fx];
                             stencil[fi].fixed = true;
                         } else if is_bottom_chunk && fy == 0 {
                             // Deep bedrock ground reference (0 V)
@@ -158,13 +145,16 @@ pub fn solve_local_electric_field(world: &mut WorldState, active_mask: &[bool]) 
                             || mat == MaterialId::RUIN_CONDUIT_CASING
                         {
                             source = 14.0;
-                        } else if mat.is_air() && wy > (chunks_y * CHUNK_SIZE) / 3 {
-                            if let Some(wave_x) = wave_x {
-                                let wave = wave_x[fx] * lightning_y[cy * axis + fy];
-                                if wave > 0.72 {
-                                    source = ((wave - 0.72) as f32) * 320.0;
-                                }
-                            }
+                        } else if mat.is_air()
+                            && !balls.is_empty()
+                            && surface.get(wx).is_some_and(|&height| {
+                                (usize::from(height) + 10..=usize::from(height) + 140).contains(&wy)
+                            })
+                        {
+                            source = balls
+                                .iter()
+                                .map(|ball| ball.potential(wx, wy))
+                                .fold(0.0, f32::max);
                         }
                         stencil[fi].numerator = if stencil[fi].fixed {
                             source
@@ -245,6 +235,89 @@ pub fn solve_local_electric_field(world: &mut WorldState, active_mask: &[bool]) 
                 }
             },
         );
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct LightningBall {
+    x: f32,
+    y: f32,
+    radius: f32,
+    start: usize,
+    end: usize,
+}
+
+impl LightningBall {
+    fn potential(self, x: usize, y: usize) -> f32 {
+        if !(self.start..self.end).contains(&x) {
+            return 0.0;
+        }
+        let dx = x as f32 - self.x;
+        let dy = y as f32 - self.y;
+        let falloff = (1.0 - (dx * dx + dy * dy) / (self.radius * self.radius)).max(0.0);
+        360.0 * falloff * falloff
+    }
+}
+
+fn lightning_balls(world: &WorldState) -> Vec<LightningBall> {
+    // Adjacent hashed waypoints share an endpoint. Smooth interpolation keeps
+    // the motion continuous without replaying a sinusoidal orbit.
+    const LEG_TICKS: u64 = 420;
+    let leg = world.clock.tick.0 / LEG_TICKS;
+    let t = (world.clock.tick.0 % LEG_TICKS) as f32 / LEG_TICKS as f32;
+    let blend = t * t * (3.0 - 2.0 * t);
+    let mut balls = Vec::new();
+    for region in &world.regions {
+        if region.weather != WeatherSpectacle::WanderingBallLightning
+            || region.x_start >= region.x_end
+        {
+            continue;
+        }
+        let key = u64::from(region.id.0) << 8;
+        let count = 2 + world.seed.derive_u64("ball-lightning-count", key) % 3;
+        let span = (region.x_end - region.x_start) as f32;
+        for id in 0..count {
+            let waypoint = |leg: u64| {
+                let hash = world.seed.derive_u64(
+                    "ball-lightning-waypoint",
+                    leg.wrapping_mul(65536).wrapping_add(key + id),
+                );
+                let unit = |shift| ((hash >> shift) as u16) as f32 / f32::from(u16::MAX);
+                [unit(0), unit(16), unit(32)]
+            };
+            let a = waypoint(leg);
+            let b = waypoint(leg + 1);
+            let [wander, height, size] = std::array::from_fn(|i| a[i] + (b[i] - a[i]) * blend);
+            let lane_width = span / count as f32;
+            let x = region.x_start as f32 + (id as f32 + 0.15 + 0.7 * wander) * lane_width;
+            let column = (x as usize).min(region.x_end - 1);
+            let Some(&ground) = world.topology.surface_height.get(column) else {
+                continue;
+            };
+            let next_ground = world
+                .topology
+                .surface_height
+                .get((column + 1).min(region.x_end - 1))
+                .copied()
+                .unwrap_or(ground);
+            let ground =
+                f32::from(ground) + (f32::from(next_ground) - f32::from(ground)) * x.fract();
+            let bottom = ground + 10.0;
+            let top = (ground + 140.0).min(world.height_cells().saturating_sub(2) as f32);
+            if bottom > top {
+                continue;
+            }
+            let radius = (9.0 + 7.0 * size).min(lane_width * 0.44).max(2.0);
+            let y = bottom + (top - bottom) * (0.2 + 0.6 * height);
+            balls.push(LightningBall {
+                x,
+                y,
+                radius,
+                start: region.x_start,
+                end: region.x_end,
+            });
+        }
+    }
+    balls
 }
 
 #[inline]

@@ -19,7 +19,7 @@ pub fn world_state_hash(world: &WorldState) -> [u8; 32] {
         };
     }
 
-    h.update(b"plain-world-state-hash-v3:");
+    h.update(b"plain-world-state-hash-v4:");
     h.update(&world.seed.0);
     let config = &world.config;
     ints!(
@@ -109,14 +109,23 @@ pub fn world_state_hash(world: &WorldState) -> [u8; 32] {
         for &v in &l1.temperature_dk {
             h.update(&v.to_le_bytes());
         }
+        h.update(&l1.microbial_meso_step.to_le_bytes());
         len!(l1.microbe_saprotroph);
-        h.update(&l1.microbe_saprotroph);
+        for &value in &l1.microbe_saprotroph {
+            h.update(&value.to_le_bytes());
+        }
         len!(l1.microbe_conductive);
-        h.update(&l1.microbe_conductive);
+        for &value in &l1.microbe_conductive {
+            h.update(&value.to_le_bytes());
+        }
         len!(l1.microbe_halophile);
-        h.update(&l1.microbe_halophile);
+        for &value in &l1.microbe_halophile {
+            h.update(&value.to_le_bytes());
+        }
         len!(l1.microbe_ferro);
-        h.update(&l1.microbe_ferro);
+        for &value in &l1.microbe_ferro {
+            h.update(&value.to_le_bytes());
+        }
         len!(l1.electric_potential);
         for &v in &l1.electric_potential {
             floats!(v);
@@ -164,6 +173,7 @@ pub fn world_state_hash(world: &WorldState) -> [u8; 32] {
                 bucket.start_step,
                 bucket.end_step,
                 bucket.water_per_col,
+                bucket.moisture.samples,
                 bucket.settled_water_ul
             );
             bytes!(bucket.era);
@@ -176,6 +186,7 @@ pub fn world_state_hash(world: &WorldState) -> [u8; 32] {
                 bucket.fertility,
                 bucket.salinity,
                 bucket.charge,
+                bucket.moisture.sum,
             ] {
                 ints!(canonical_f64(value));
             }
@@ -187,7 +198,8 @@ pub fn world_state_hash(world: &WorldState) -> [u8; 32] {
                 record.net_water_delta_per_col,
                 record.settled_water_ul
             );
-            bytes!(record.era, record.weather);
+            bytes!(record.era, record.weather, record.moisture.is_some() as u8);
+            floats!(record.moisture.unwrap_or_default());
             floats!(
                 record.acid_erosion_impulse,
                 record.salt_deposition_impulse,

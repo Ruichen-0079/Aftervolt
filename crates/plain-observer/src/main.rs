@@ -5,7 +5,7 @@
 //! Strictly consumes `DevTelemetryPort` (god-view diagnostic port isolated from future player perception).
 //! Supports:
 //! 1. Global map & pan/zoom inspection with L3 basins, sinkholes & ruin geological anchors
-//! 2. 13 environment/field overlays (L0 material/fluid/yield, L1 pH/fertility/salinity/temp/4 microbes/electric)
+//! 2. 14 environment/field overlays with same-viewport potential and conductivity comparison
 //! 3. Conservation & population telemetry plots (Stage 1 conservation curves; Stage 2 population slot ready)
 //! 4. Cell & individual probe inspector
 //! 5. Time control (Pause/Play, Step Fine/Macro, Speed, +30/+365/+1220d Fast-Forward, Era Breakpoint)

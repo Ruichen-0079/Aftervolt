@@ -8,7 +8,7 @@
 use std::path::PathBuf;
 use std::time::Instant;
 
-use plain_contracts::materials::MaterialId;
+use plain_contracts::materials::{FluidKind, MaterialId};
 use plain_contracts::{
     CellCoord, DevTelemetryPort, FieldDownsample, MasterSeed, ViewportRect, WorldConfig,
     WorldPosMeters,
@@ -18,6 +18,9 @@ use plain_world::electric::sample_electric_gradient;
 use plain_world::fluid::wake_fluid_chunks;
 use plain_world::{electric, fields, fluid, WorldSimulation, WorldState};
 use plain_worldgen::generate_valid_world;
+
+#[path = "../../plain-world/tests/support/three_modes.rs"]
+mod three_modes;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("=========================================================================");
@@ -29,9 +32,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     run_q3_full_6144x2048_worst_case_throughput()?;
     run_q4_world_dimension_scaling()?;
     run_q7_1220_day_multiscale_and_catchup_consistency()?;
+    run_q7_three_modes();
     run_q7_long_ecology(12_200)?;
     run_q7_long_ecology(36_600)?;
-    run_q7_dormant_water()?;
+    run_q7_dormant_water(12_200)?;
+    run_q7_dormant_water(36_600)?;
 
     println!("\n[ALL QUANTITATIVE BENCHMARKS COMPLETED]");
     Ok(())
@@ -249,23 +254,45 @@ fn run_q7_1220_day_multiscale_and_catchup_consistency() -> Result<(), Box<dyn st
         let (world, _, _) = generate_valid_world(cfg, MasterSeed::from_u64(707), 4)?;
         let mut sim = WorldSimulation::new(world);
 
+        let initial_transitions: Vec<_> = sim
+            .world
+            .regions
+            .iter()
+            .map(|basin| basin.era_transitions_count)
+            .collect();
         let one_cycle_steps = 1220u64 * (steps_per_day as u64);
         let t_1c = Instant::now();
-        let trans_1c = sim.step_macro_steps(one_cycle_steps, false);
+        sim.step_macro_steps(one_cycle_steps, false);
         let ms_1c = t_1c.elapsed().as_secs_f64() * 1000.0;
         verify_water(&sim.world, "1220-day macro")?;
 
         let two_more_steps = 2 * one_cycle_steps;
         let t_3c = Instant::now();
-        let trans_2c = sim.step_macro_steps(two_more_steps, false);
+        sim.step_macro_steps(two_more_steps, false);
         let ms_total_3c = ms_1c + t_3c.elapsed().as_secs_f64() * 1000.0;
 
         verify_water(&sim.world, "3660-day macro")?;
+        let t_catch_up = Instant::now();
         sim.catch_up_all_chunks();
+        let catch_up_ms = t_catch_up.elapsed().as_secs_f64() * 1000.0;
         verify_water(&sim.world, "3660-day catch-up")?;
+        let transitions: Vec<_> = sim
+            .world
+            .regions
+            .iter()
+            .zip(initial_transitions)
+            .map(|(basin, start)| {
+                let count = basin.era_transitions_count - start;
+                assert!(
+                    count >= 8,
+                    "流域 {:?} 在 3660 日内只切换 {count} 次",
+                    basin.id
+                );
+                count
+            })
+            .collect();
         println!(
-            "  宏步={steps_per_day:2}/日 | 1x1220日={ms_1c:6.2}ms (切换{trans_1c}次) | 3x1220日={ms_total_3c:6.2}ms (总切换{}次) | 总水漂移=0 uL",
-            trans_1c + trans_2c
+            "  宏步={steps_per_day:2}/日 | 1220日={ms_1c:6.2}ms | 3660日={ms_total_3c:6.2}ms | 全图追平={catch_up_ms:6.2}ms | 逐流域切换={transitions:?} | 水漂移 0 uL"
         );
     }
 
@@ -367,6 +394,18 @@ fn run_q7_1220_day_multiscale_and_catchup_consistency() -> Result<(), Box<dyn st
     Ok(())
 }
 
+fn run_q7_three_modes() {
+    let samples = three_modes::run();
+    println!("  同种子同流域 4 日对照 | 水位（m）/ 下游积水（uL）/ 四菌群均值 / L1 电导率均值");
+    for (mode, sample) in ["休眠", "快进", "实时"].into_iter().zip(samples) {
+        println!(
+            "    {mode} | {:.4} m | {} uL | {:.3?} | {:.3}",
+            sample.channel_level_m, sample.downstream_ul, sample.microbes, sample.conductivity
+        );
+    }
+    three_modes::assert_close(samples);
+}
+
 fn verify_water(world: &WorldState, label: &str) -> Result<(), Box<dyn std::error::Error>> {
     let drift = world.total_world_water().2 .0 - world.initial_world_water_ul;
     if drift != 0
@@ -428,6 +467,22 @@ fn ecology_sample(world: &WorldState) -> EcologySample {
     result
 }
 
+fn black_water_ul(world: &WorldState) -> i64 {
+    world
+        .l0_chunks
+        .iter()
+        .map(|chunk| {
+            chunk
+                .fluid_kind
+                .iter()
+                .zip(&chunk.fluid_volume)
+                .filter(|(&kind, _)| kind == FluidKind::BlackWater as u8)
+                .map(|(_, &volume)| i64::from(volume))
+                .sum::<i64>()
+        })
+        .sum()
+}
+
 fn run_q7_long_ecology(days: u64) -> Result<(), Box<dyn std::error::Error>> {
     let start = Instant::now();
     let mut cfg = WorldConfig::preset_ci_1024x512();
@@ -436,6 +491,7 @@ fn run_q7_long_ecology(days: u64) -> Result<(), Box<dyn std::error::Error>> {
     let mut sim = WorldSimulation::new(world);
     let initial = ecology_sample(&sim.world);
     let initial_vapor = sim.world.total_world_water().1 .0;
+    let initial_black_water = black_water_ul(&sim.world);
     let steps_per_day = u64::from(sim.world.config.clock.macro_steps_per_game_day);
     let mut previous_salt = initial.salts;
     let mut salt_gains = 0;
@@ -443,6 +499,7 @@ fn run_q7_long_ecology(days: u64) -> Result<(), Box<dyn std::error::Error>> {
     let mut salt_peak = initial.salts;
     let mut min_vapor = initial_vapor;
     let mut max_pending = 0;
+    let mut min_black_water = initial_black_water;
     let mut min_ph = initial.ph;
     let mut max_ph = initial.ph;
     let all = vec![true; sim.world.l0_chunks.len()];
@@ -468,6 +525,9 @@ fn run_q7_long_ecology(days: u64) -> Result<(), Box<dyn std::error::Error>> {
         salt_gains += usize::from(sample.salts > previous_salt);
         salt_losses += usize::from(sample.salts < previous_salt);
         previous_salt = sample.salts;
+        if (day + duration) / 1220 != day / 1220 || day + duration == days {
+            min_black_water = min_black_water.min(black_water_ul(&sim.world));
+        }
         min_ph = min_ph.min(sample.ph);
         max_ph = max_ph.max(sample.ph);
         if sample.acidic_floor * 100 > sample.tiles
@@ -483,11 +543,19 @@ fn run_q7_long_ecology(days: u64) -> Result<(), Box<dyn std::error::Error>> {
                 sample.silt, sample.travertine).into());
         }
     }
+    assert!(
+        initial_black_water > 0 && min_black_water >= initial_black_water / 2,
+        "Q7 {days}-day black-water reservoir fell to {min_black_water}/{initial_black_water} uL"
+    );
     let end = ecology_sample(&sim.world);
     println!(
         "  {days}日（含细格流体沉降）| {:.2}s | pH {:.3}–{:.3} | 最低水汽 {:.1}% | 待沉降峰值 {} uL | 盐壳峰值 {}（增{}次/减{}次）| 粉砂 {}→{} | 钙华 {}→{} | 盐度 {:.0}→{:.0} | 水漂移 0 uL",
         start.elapsed().as_secs_f64(), min_ph, max_ph, min_vapor as f64 / initial_vapor as f64 * 100.0,
         max_pending, salt_peak, salt_gains, salt_losses, initial.silt, end.silt, initial.travertine, end.travertine, initial.salinity, end.salinity
+    );
+    println!(
+        "    暗河黑水最低实测 {:.1}%（每纪元循环采样）",
+        min_black_water as f64 * 100.0 / initial_black_water as f64
     );
     if salt_peak == 0 || salt_gains < 2 || salt_losses < 2 || max_ph - min_ph < 0.15 {
         return Err("Q7 missing seasonal salt-crust or pH oscillation".into());
@@ -501,7 +569,8 @@ fn ten_cycles_with_fluid_settling_remain_dynamic() {
     run_q7_long_ecology(12_200).unwrap();
 }
 
-fn run_q7_dormant_water() -> Result<(), Box<dyn std::error::Error>> {
+fn run_q7_dormant_water(days: u64) -> Result<(), Box<dyn std::error::Error>> {
+    let started = Instant::now();
     let (world, _, _) = generate_valid_world(
         WorldConfig::preset_ci_1024x512(),
         MasterSeed::from_u64(42),
@@ -509,11 +578,12 @@ fn run_q7_dormant_water() -> Result<(), Box<dyn std::error::Error>> {
     )?;
     let mut sim = WorldSimulation::new(world);
     let initial_vapor = sim.world.total_world_water().1 .0;
+    let initial_black_water = black_water_ul(&sim.world);
     let spd = u64::from(sim.world.config.clock.macro_steps_per_game_day);
     let mut min_vapor = initial_vapor;
     let mut max_pending = 0;
-    for day in (0..12_200u64).step_by(30) {
-        sim.step_macro_steps((12_200 - day).min(30) * spd, false);
+    for day in (0..days).step_by(30) {
+        sim.step_macro_steps((days - day).min(30) * spd, false);
         verify_water(&sim.world, "dormant ecology")?;
         min_vapor = min_vapor.min(sim.world.total_world_water().1 .0);
         let pending: i64 = sim
@@ -548,9 +618,13 @@ fn run_q7_dormant_water() -> Result<(), Box<dyn std::error::Error>> {
     if sample.acidic_floor * 100 > sample.tiles || sample.fertility_ceiling * 100 > sample.tiles {
         return Err("Q7 archive replay produced saturated chemistry".into());
     }
+    let black_water = black_water_ul(&sim.world);
+    assert!(initial_black_water > 0 && black_water >= initial_black_water / 2,
+        "Q7 {days}-day dormant black-water reservoir fell to {black_water}/{initial_black_water} uL");
     println!(
-        "  12200日（纯宏步休眠后全图追平）| 最低水汽 {:.1}% | 待沉降峰值 {max_pending} uL | pH {:.3} | 水漂移 0 uL",
-        min_vapor as f64 / initial_vapor as f64 * 100.0, sample.ph
+        "  {days}日（纯宏步休眠后全图追平）| {:.2}s | 最低水汽 {:.1}% | 暗河黑水 {:.1}% | 待沉降峰值 {max_pending} uL | pH {:.3} | 水漂移 0 uL",
+        started.elapsed().as_secs_f64(), min_vapor as f64 / initial_vapor as f64 * 100.0,
+        black_water as f64 * 100.0 / initial_black_water as f64, sample.ph
     );
     Ok(())
 }

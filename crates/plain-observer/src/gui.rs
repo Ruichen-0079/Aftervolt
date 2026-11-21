@@ -41,6 +41,7 @@ struct ObserverApp {
     pause_on_era_change: bool,
     show_anchors: bool,
     show_basin_lines: bool,
+    compare_electric_fields: bool,
 
     // Camera in cell coordinates
     cam_center_x: f64,
@@ -49,6 +50,7 @@ struct ObserverApp {
 
     // Cached GPU textures
     viewport_tex: Option<egui::TextureHandle>,
+    comparison_tex: Option<egui::TextureHandle>,
     overview_tex: Option<egui::TextureHandle>,
     needs_overview_refresh: bool,
 
@@ -75,10 +77,12 @@ impl ObserverApp {
             pause_on_era_change: false,
             show_anchors: true,
             show_basin_lines: true,
+            compare_electric_fields: false,
             cam_center_x: w * 0.5,
             cam_center_y: h * 0.52,
             cam_span_x: (w * 0.35).min(1800.0),
             viewport_tex: None,
+            comparison_tex: None,
             overview_tex: None,
             needs_overview_refresh: true,
             probed: None,
@@ -87,6 +91,14 @@ impl ObserverApp {
             moisture_history: vec![VecDeque::with_capacity(240); region_count],
             frame_us_history: VecDeque::with_capacity(240),
             sample_counter: 0,
+        }
+    }
+
+    fn companion_electric_overlay(&self) -> Option<OverlayKind> {
+        match self.overlay {
+            OverlayKind::ElectricPotential => Some(OverlayKind::ConductivityField),
+            OverlayKind::ConductivityField => Some(OverlayKind::ElectricPotential),
+            _ => None,
         }
     }
 
@@ -134,11 +146,8 @@ impl ObserverApp {
         self.frame_us_history
             .push_back([self.sample_counter as f64, prof.latest.total_us as f64]);
     }
-}
 
-impl eframe::App for ObserverApp {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // 1. Advance simulation if playing
+    fn step_simulation_if_playing(&mut self, ctx: &egui::Context) {
         if self.playing {
             let mut hit_era_break = false;
             for _ in 0..self.fine_steps_per_frame {
@@ -153,8 +162,9 @@ impl eframe::App for ObserverApp {
             self.record_telemetry_sample();
             ctx.request_repaint();
         }
+    }
 
-        // 2. Top Time Control & Overlay Toolbar (Capability 2 & 5)
+    fn show_top_toolbar(&mut self, ctx: &egui::Context) {
         egui::TopBottomPanel::top("top_controls").show(ctx, |ui| {
             ui.horizontal_wrapped(|ui| {
                 if ui
@@ -224,6 +234,9 @@ impl eframe::App for ObserverApp {
                             }
                         }
                     });
+                if self.companion_electric_overlay().is_some() {
+                    ui.checkbox(&mut self.compare_electric_fields, "同帧对照");
+                }
             });
 
             ui.horizontal(|ui| {
@@ -240,8 +253,9 @@ impl eframe::App for ObserverApp {
                 ));
             });
         });
+    }
 
-        // 3. Right Sidebar: Conservation, Region Eras, Cell Probe & Profiler (Capabilities 3, 4, 6)
+    fn show_telemetry_sidebar(&mut self, ctx: &egui::Context) {
         egui::SidePanel::right("telemetry_panel")
             .min_width(360.0)
             .show(ctx, |ui| {
@@ -249,9 +263,7 @@ impl eframe::App for ObserverApp {
                     // Section A: Global Map Thumbnail (Capability 1)
                     ui.heading("1. 全局地图总览 (点击跳转)");
                     if self.needs_overview_refresh || self.overview_tex.is_none() {
-                        let ov = self
-                            .sim
-                            .render_world_overview(320, 110, self.overlay);
+                        let ov = self.sim.render_world_overview(320, 110, self.overlay);
                         let img = egui::ColorImage::from_rgba_unmultiplied(
                             [ov.width_px as usize, ov.height_px as usize],
                             &ov.rgba,
@@ -271,10 +283,13 @@ impl eframe::App for ObserverApp {
                         );
                         if resp.clicked() {
                             if let Some(pos) = resp.interact_pointer_pos() {
-                                let nx = ((pos.x - resp.rect.min.x) / resp.rect.width()).clamp(0.0, 1.0);
-                                let ny = (1.0 - (pos.y - resp.rect.min.y) / resp.rect.height()).clamp(0.0, 1.0);
+                                let nx =
+                                    ((pos.x - resp.rect.min.x) / resp.rect.width()).clamp(0.0, 1.0);
+                                let ny = (1.0 - (pos.y - resp.rect.min.y) / resp.rect.height())
+                                    .clamp(0.0, 1.0);
                                 self.cam_center_x = nx as f64 * self.sim.world.width_cells() as f64;
-                                self.cam_center_y = ny as f64 * self.sim.world.height_cells() as f64;
+                                self.cam_center_y =
+                                    ny as f64 * self.sim.world.height_cells() as f64;
                             }
                         }
                     }
@@ -282,8 +297,7 @@ impl eframe::App for ObserverApp {
                     ui.separator();
                     // Section B: Conservation & Basin Era Telemetry (Capability 3)
                     ui.heading("2. 守恒与宏观流域遥测 (Stage 2 种群位预留)");
-                    let drift =
-                        self.ledger.total_world_water.0 - self.ledger.initial_world_water.0;
+                    let drift = self.ledger.total_world_water.0 - self.ledger.initial_world_water.0;
                     ui.label(format!(
                         "全图总水量: {} uL (漂移: {} uL)",
                         self.ledger.total_world_water.0, drift
@@ -303,11 +317,7 @@ impl eframe::App for ObserverApp {
 
                     for r in &self.ledger.regions {
                         ui.group(|ui| {
-                            ui.strong(format!(
-                                "{} — {}",
-                                r.name,
-                                r.era.label_cn()
-                            ));
+                            ui.strong(format!("{} — {}", r.name, r.era.label_cn()));
                             ui.label(format!(
                                 "气象: {} | 历时 {:.1}d | 湿:{:.2} 盐壳:{:.2} 肥:{:.2} pH:{:.1}",
                                 r.weather.label_cn(),
@@ -337,7 +347,11 @@ impl eframe::App for ObserverApp {
                     if let Some(p) = &self.probed {
                         ui.label(format!(
                             "坐标: ({}, {}) | {:.1}m, {:.1}m | 流域 {}",
-                            p.cell.x, p.cell.y, p.world_pos.x, p.world_pos.y, p.region_id.0 + 1
+                            p.cell.x,
+                            p.cell.y,
+                            p.world_pos.x,
+                            p.world_pos.y,
+                            p.region_id.0 + 1
                         ));
                         ui.label(format!(
                             "材质: {} | 屈服 {} kPa | 酸蚀 {} | 完整度 {}",
@@ -379,7 +393,10 @@ impl eframe::App for ObserverApp {
                     let prof = self.sim.profiler_snapshot();
                     ui.label(format!(
                         "最新步耗时: {} us (P50={} / P95={} / P99={} us)",
-                        prof.latest.total_us, prof.p50_total_us, prof.p95_total_us, prof.p99_total_us
+                        prof.latest.total_us,
+                        prof.p50_total_us,
+                        prof.p95_total_us,
+                        prof.p99_total_us
                     ));
                     ui.label(format!(
                         "明细 us — 流体:{} | L1场:{} | 电场:{} | 宏气候:{} | 追平:{}",
@@ -401,112 +418,176 @@ impl eframe::App for ObserverApp {
                     });
                 });
             });
+    }
 
-        // 4. Central Interactive Viewport (Pan / Zoom / Click-to-Probe + Vector Annotations)
-        egui::CentralPanel::default().show(ctx, |ui| {
-            let avail = ui.available_size();
-            let aspect = (avail.x / avail.y.max(1.0)) as f64;
-            let vp = self.current_viewport(aspect);
-            // Panning and zooming update the telemetry viewport only.
-            self.sim.set_dev_camera(0, vp);
+    fn show_main_viewport(&mut self, ctx: &egui::Context) -> ViewportRect {
+        egui::CentralPanel::default()
+            .show(ctx, |ui| {
+                let avail = ui.available_size();
+                let aspect = (avail.x / avail.y.max(1.0)) as f64;
+                let vp = self.current_viewport(aspect);
+                // Panning and zooming update the telemetry viewport only.
+                self.sim.set_dev_camera(0, vp);
 
-            let tex_w = (avail.x as u32).clamp(160, 1280);
-            let tex_h = (avail.y as u32).clamp(120, 820);
-            let snap = self.sim.render_viewport(vp, tex_w, tex_h, self.overlay);
-            let img = egui::ColorImage::from_rgba_unmultiplied(
-                [snap.width_px as usize, snap.height_px as usize],
-                &snap.rgba,
-            );
-            let tex = self.viewport_tex.insert(ctx.load_texture(
-                "main_viewport",
-                img,
-                egui::TextureOptions::NEAREST,
-            ));
+                let tex_w = (avail.x as u32).clamp(160, 1280);
+                let tex_h = (avail.y as u32).clamp(120, 820);
+                let snap = self.sim.render_viewport(vp, tex_w, tex_h, self.overlay);
+                let img = egui::ColorImage::from_rgba_unmultiplied(
+                    [snap.width_px as usize, snap.height_px as usize],
+                    &snap.rgba,
+                );
+                let tex = self.viewport_tex.insert(ctx.load_texture(
+                    "main_viewport",
+                    img,
+                    egui::TextureOptions::NEAREST,
+                ));
 
-            let resp = ui.add(
-                egui::Image::new(&*tex)
-                    .fit_to_exact_size(avail)
-                    .sense(egui::Sense::click_and_drag()),
-            );
+                let resp = ui.add(
+                    egui::Image::new(&*tex)
+                        .fit_to_exact_size(avail)
+                        .sense(egui::Sense::click_and_drag()),
+                );
 
-            // Drag to pan
-            if resp.dragged() {
-                let d = resp.drag_delta();
-                let cells_per_px_x = (vp.max_x - vp.min_x) as f64 / resp.rect.width().max(1.0) as f64;
-                let cells_per_px_y = (vp.max_y - vp.min_y) as f64 / resp.rect.height().max(1.0) as f64;
-                self.cam_center_x = (self.cam_center_x - d.x as f64 * cells_per_px_x)
-                    .clamp(0.0, self.sim.world.width_cells() as f64);
-                self.cam_center_y = (self.cam_center_y + d.y as f64 * cells_per_px_y)
-                    .clamp(0.0, self.sim.world.height_cells() as f64);
-            }
-
-            // Scroll wheel zoom
-            if resp.hovered() {
-                let scroll = ui.input(|i| i.smooth_scroll_delta.y);
-                if scroll.abs() > 0.1 {
-                    let zoom = if scroll > 0.0 { 0.86 } else { 1.16 };
-                    self.cam_span_x = (self.cam_span_x * zoom)
-                        .clamp(64.0, self.sim.world.width_cells() as f64);
+                // Drag to pan
+                if resp.dragged() {
+                    let d = resp.drag_delta();
+                    let cells_per_px_x =
+                        (vp.max_x - vp.min_x) as f64 / resp.rect.width().max(1.0) as f64;
+                    let cells_per_px_y =
+                        (vp.max_y - vp.min_y) as f64 / resp.rect.height().max(1.0) as f64;
+                    self.cam_center_x = (self.cam_center_x - d.x as f64 * cells_per_px_x)
+                        .clamp(0.0, self.sim.world.width_cells() as f64);
+                    self.cam_center_y = (self.cam_center_y + d.y as f64 * cells_per_px_y)
+                        .clamp(0.0, self.sim.world.height_cells() as f64);
                 }
-            }
 
-            // Click to probe exact cell
-            if resp.clicked() {
-                if let Some(pos) = resp.interact_pointer_pos() {
-                    let nx = ((pos.x - resp.rect.min.x) / resp.rect.width()).clamp(0.0, 1.0);
-                    let ny = (1.0 - (pos.y - resp.rect.min.y) / resp.rect.height()).clamp(0.0, 1.0);
-                    let wx = vp.min_x + (nx as f64 * (vp.max_x - vp.min_x) as f64) as i32;
-                    let wy = vp.min_y + (ny as f64 * (vp.max_y - vp.min_y) as f64) as i32;
-                    self.probed = self.sim.probe_cell(CellCoord::new(wx, wy));
+                // Scroll wheel zoom
+                if resp.hovered() {
+                    let scroll = ui.input(|i| i.smooth_scroll_delta.y);
+                    if scroll.abs() > 0.1 {
+                        let zoom = if scroll > 0.0 { 0.86 } else { 1.16 };
+                        self.cam_span_x = (self.cam_span_x * zoom)
+                            .clamp(64.0, self.sim.world.width_cells() as f64);
+                    }
                 }
-            }
 
-            // Overlay L3 basin boundaries & geological ruin anchors / sinkholes
-            let painter = ui.painter_at(resp.rect);
-            let to_screen = |wx: f64, wy: f64| -> egui::Pos2 {
-                let nx = ((wx - vp.min_x as f64) / (vp.max_x - vp.min_x).max(1) as f64) as f32;
-                let ny = 1.0 - ((wy - vp.min_y as f64) / (vp.max_y - vp.min_y).max(1) as f64) as f32;
-                egui::pos2(
-                    resp.rect.min.x + nx * resp.rect.width(),
-                    resp.rect.min.y + ny * resp.rect.height(),
-                )
-            };
+                // Click to probe exact cell
+                if resp.clicked() {
+                    if let Some(pos) = resp.interact_pointer_pos() {
+                        let nx = ((pos.x - resp.rect.min.x) / resp.rect.width()).clamp(0.0, 1.0);
+                        let ny =
+                            (1.0 - (pos.y - resp.rect.min.y) / resp.rect.height()).clamp(0.0, 1.0);
+                        let wx = vp.min_x + (nx as f64 * (vp.max_x - vp.min_x) as f64) as i32;
+                        let wy = vp.min_y + (ny as f64 * (vp.max_y - vp.min_y) as f64) as i32;
+                        self.probed = self.sim.probe_cell(CellCoord::new(wx, wy));
+                    }
+                }
 
-            if self.show_basin_lines {
-                for r in &self.sim.world.regions {
-                    let sx = to_screen(r.x_start as f64, 0.0).x;
-                    if sx >= resp.rect.min.x && sx <= resp.rect.max.x {
+                // Overlay L3 basin boundaries & geological ruin anchors / sinkholes
+                let painter = ui.painter_at(resp.rect);
+                let to_screen = |wx: f64, wy: f64| -> egui::Pos2 {
+                    let nx = ((wx - vp.min_x as f64) / (vp.max_x - vp.min_x).max(1) as f64) as f32;
+                    let ny =
+                        1.0 - ((wy - vp.min_y as f64) / (vp.max_y - vp.min_y).max(1) as f64) as f32;
+                    egui::pos2(
+                        resp.rect.min.x + nx * resp.rect.width(),
+                        resp.rect.min.y + ny * resp.rect.height(),
+                    )
+                };
+
+                if self.show_basin_lines {
+                    for r in &self.sim.world.regions {
+                        let sx = to_screen(r.x_start as f64, 0.0).x;
+                        if sx >= resp.rect.min.x && sx <= resp.rect.max.x {
+                            painter.line_segment(
+                                [
+                                    egui::pos2(sx, resp.rect.min.y),
+                                    egui::pos2(sx, resp.rect.max.y),
+                                ],
+                                egui::Stroke::new(
+                                    1.0_f32,
+                                    egui::Color32::from_rgba_unmultiplied(255, 255, 255, 70),
+                                ),
+                            );
+                        }
+                    }
+                }
+
+                if self.show_anchors {
+                    for a in &self.sim.world.topology.ruin_anchors {
+                        let p0 = to_screen(a.min_x as f64, a.max_y as f64);
+                        let p1 = to_screen(a.max_x as f64, a.min_y as f64);
+                        let rect = egui::Rect::from_two_pos(p0, p1);
+                        if rect.intersects(resp.rect) {
+                            painter.rect_stroke(
+                                rect,
+                                0.0_f32,
+                                egui::Stroke::new(1.5_f32, egui::Color32::from_rgb(255, 160, 64)),
+                                egui::StrokeKind::Middle,
+                            );
+                        }
+                    }
+                    for sh in &self.sim.world.topology.sinkholes {
+                        let p_top = to_screen(sh.x_center as f64, sh.top_y as f64);
+                        let p_bot = to_screen(sh.x_center as f64, sh.bottom_y as f64);
                         painter.line_segment(
-                            [egui::pos2(sx, resp.rect.min.y), egui::pos2(sx, resp.rect.max.y)],
-                            egui::Stroke::new(1.0_f32, egui::Color32::from_rgba_unmultiplied(255, 255, 255, 70)),
+                            [p_top, p_bot],
+                            egui::Stroke::new(
+                                1.5_f32,
+                                egui::Color32::from_rgba_unmultiplied(90, 220, 255, 130),
+                            ),
                         );
                     }
                 }
-            }
+                vp
+            })
+            .inner
+    }
 
-            if self.show_anchors {
-                for a in &self.sim.world.topology.ruin_anchors {
-                    let p0 = to_screen(a.min_x as f64, a.max_y as f64);
-                    let p1 = to_screen(a.max_x as f64, a.min_y as f64);
-                    let rect = egui::Rect::from_two_pos(p0, p1);
-                    if rect.intersects(resp.rect) {
-                        painter.rect_stroke(
-                            rect,
-                            0.0_f32,
-                            egui::Stroke::new(1.5_f32, egui::Color32::from_rgb(255, 160, 64)),
-                            egui::StrokeKind::Middle,
-                        );
-                    }
-                }
-                for sh in &self.sim.world.topology.sinkholes {
-                    let p_top = to_screen(sh.x_center as f64, sh.top_y as f64);
-                    let p_bot = to_screen(sh.x_center as f64, sh.bottom_y as f64);
-                    painter.line_segment(
-                        [p_top, p_bot],
-                        egui::Stroke::new(1.5_f32, egui::Color32::from_rgba_unmultiplied(90, 220, 255, 130)),
+    fn show_electric_comparison_window(&mut self, ctx: &egui::Context, viewport: ViewportRect) {
+        if let Some(overlay) = self.companion_electric_overlay() {
+            egui::Window::new(overlay.label())
+                .id(egui::Id::new("electric_field_comparison"))
+                .default_width(380.0)
+                .open(&mut self.compare_electric_fields)
+                .show(ctx, |ui| {
+                    let width = ui.available_width().clamp(120.0, 720.0);
+                    let aspect = (viewport.max_x - viewport.min_x).max(1) as f32
+                        / (viewport.max_y - viewport.min_y).max(1) as f32;
+                    let height = (width / aspect).min(460.0);
+                    let size = egui::vec2(height * aspect, height);
+                    let snapshot = self.sim.render_viewport(
+                        viewport,
+                        size.x.ceil() as u32,
+                        size.y.ceil() as u32,
+                        overlay,
                     );
-                }
-            }
-        });
+                    let image = egui::ColorImage::from_rgba_unmultiplied(
+                        [snapshot.width_px as usize, snapshot.height_px as usize],
+                        &snapshot.rgba,
+                    );
+                    let options = egui::TextureOptions::NEAREST;
+                    let texture = match &mut self.comparison_tex {
+                        Some(texture) => {
+                            texture.set(image, options);
+                            texture
+                        }
+                        slot @ None => {
+                            slot.insert(ctx.load_texture("electric_comparison", image, options))
+                        }
+                    };
+                    ui.add(egui::Image::new(&*texture).fit_to_exact_size(size));
+                });
+        }
+    }
+}
+
+impl eframe::App for ObserverApp {
+    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.step_simulation_if_playing(ctx);
+        self.show_top_toolbar(ctx);
+        self.show_telemetry_sidebar(ctx);
+        let viewport = self.show_main_viewport(ctx);
+        self.show_electric_comparison_window(ctx, viewport);
     }
 }

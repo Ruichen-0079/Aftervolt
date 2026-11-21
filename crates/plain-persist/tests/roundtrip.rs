@@ -344,6 +344,7 @@ fn sqlite_loads_v2_meta_and_v1_chunks_with_milli_ph() {
         }],
     });
     let l1 = world.l1_chunks.remove(0);
+    let tiles = l1.ph_milli.len();
     let chunk = VersionedChunkBlob::V1(ChunkBlobV1 {
         l0: world.l0_chunks.remove(0),
         l1: FieldChunkV1 {
@@ -352,10 +353,10 @@ fn sqlite_loads_v2_meta_and_v1_chunks_with_milli_ph() {
             fertility: l1.fertility,
             salinity: l1.salinity,
             temperature_dk: l1.temperature_dk,
-            microbe_saprotroph: l1.microbe_saprotroph,
-            microbe_conductive: l1.microbe_conductive,
-            microbe_halophile: l1.microbe_halophile,
-            microbe_ferro: l1.microbe_ferro,
+            microbe_saprotroph: vec![72; tiles],
+            microbe_conductive: vec![15; tiles],
+            microbe_halophile: vec![255; tiles],
+            microbe_ferro: vec![0; tiles],
             electric_potential: l1.electric_potential,
             conductivity: l1.conductivity,
             flux_block_mask: l1.flux_block_mask,
@@ -379,6 +380,16 @@ fn sqlite_loads_v2_meta_and_v1_chunks_with_milli_ph() {
 
     let mut loaded = store.load_world().unwrap();
     assert_eq!(loaded.l1_chunks[0].ph_milli[0], 7_300);
+    let fields = &loaded.l1_chunks[0];
+    assert_eq!(
+        [
+            fields.microbe_saprotroph[0],
+            fields.microbe_conductive[0],
+            fields.microbe_halophile[0],
+            fields.microbe_ferro[0]
+        ],
+        [7_200, 1_500, 25_500, 0]
+    );
     assert_eq!(loaded.l0_chunks[0].last_realized_macro_step, 8);
     assert_eq!(loaded.regions[0].precipitation_remainder_ul, 3);
     assert_eq!(loaded.regions[0].evaporation_remainder_ul, 2);
@@ -391,6 +402,154 @@ fn sqlite_loads_v2_meta_and_v1_chunks_with_milli_ph() {
         world_state_hash(&store.load_world().unwrap()),
         world_state_hash(&loaded)
     );
+    store.close().unwrap();
+    std::fs::remove_file(path).unwrap();
+}
+
+#[test]
+fn sqlite_loads_v3_archive_and_v2_chunk_then_persists_fractional_v4_density() {
+    use plain_contracts::WorldDimensions;
+    use plain_persist::{
+        ChunkBlobV2, FieldChunkV2, VersionedChunkBlob, VersionedWorldMeta, WorldMetaV3,
+    };
+    use plain_world::{ArchivedFluxRecord, MacroFluxRecord, RegionalMacroFluxHistory, WorldState};
+
+    let (generated, _) =
+        generate_world(WorldConfig::preset_ci_1024x512(), MasterSeed::from_u64(42)).unwrap();
+    let mut config = generated.config;
+    config.dimensions = WorldDimensions::from_chunks(1, 1);
+    let mut world = WorldState::new_empty(config, generated.seed, 3);
+    world.clock.advance_macro_steps(2);
+    world.l0_chunks[0].last_realized_macro_step = 1;
+    world.topology.surface_height = vec![20; 64];
+    world.surface_reference_height = world.topology.surface_height.clone();
+
+    let region = generated
+        .regions
+        .into_iter()
+        .next()
+        .unwrap()
+        .map_flux_history(|_| RegionalMacroFluxHistory {
+            records: vec![MacroFluxRecord {
+                macro_step: 2,
+                settled_water_ul: 23,
+                ..Default::default()
+            }],
+            max_len: 1,
+            archived_buckets: vec![ArchivedFluxRecord {
+                start_step: 1,
+                end_step: 1,
+                era: 0,
+                acid: 0.0,
+                salt: 0.0,
+                flood_peak: 0.0,
+                flood_exposure: 0.0,
+                ph: 0.0,
+                fertility: 0.0,
+                salinity: 0.0,
+                charge: 0.0,
+                water_per_col: 0,
+                settled_water_ul: -12,
+                moisture: (),
+            }],
+            discarded_through: 1,
+        });
+    let metadata = VersionedWorldMeta::V3(WorldMetaV3 {
+        schema_version: 3,
+        worldgen_version: 3,
+        seed: world.seed,
+        config: world.config.clone(),
+        clock: world.clock,
+        initial_world_water_ul: region.water_vapor_ul + region.pending_surface_water_ul,
+        regions: vec![region],
+        topology: world.topology.clone(),
+        surface_reference_height: world.surface_reference_height.clone(),
+        surface_salt_inventory: world.surface_salt_inventory.clone(),
+    });
+
+    let path = std::env::temp_dir().join(format!("plain-legacy-v3-{}.sqlite", std::process::id()));
+    let mut store = WorldSaveStore::open(&path).unwrap();
+    store.save_full_baseline(&mut world, None).unwrap();
+    let l0 = world.l0_chunks.remove(0);
+    let field = world.l1_chunks.remove(0);
+    let tiles = field.ph_milli.len();
+    let chunk = VersionedChunkBlob::V2(ChunkBlobV2 {
+        l0,
+        l1: FieldChunkV2 {
+            axis_len: field.axis_len,
+            ph_milli: vec![6_537; tiles],
+            fertility: field.fertility,
+            salinity: field.salinity,
+            temperature_dk: field.temperature_dk,
+            microbe_saprotroph: vec![21; tiles],
+            microbe_conductive: vec![15; tiles],
+            microbe_halophile: vec![103; tiles],
+            microbe_ferro: vec![255; tiles],
+            electric_potential: field.electric_potential,
+            conductivity: field.conductivity,
+            flux_block_mask: field.flux_block_mask,
+        },
+    });
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    for (sql, data) in [
+        (
+            "UPDATE world_meta SET value = ?1 WHERE key = 'world_meta_v1'",
+            postcard::to_allocvec(&metadata).unwrap(),
+        ),
+        (
+            "UPDATE world_baseline SET data = ?1",
+            postcard::to_allocvec(&chunk).unwrap(),
+        ),
+    ] {
+        conn.execute(sql, [zstd::bulk::compress(&data, 1).unwrap()])
+            .unwrap();
+    }
+    conn.close().unwrap();
+
+    let mut loaded = store.load_world().unwrap();
+    let flux = &loaded.regions[0].flux_history;
+    assert_eq!(flux.discarded_through, 1);
+    assert_eq!(flux.records[0].settled_water_ul, 23);
+    assert_eq!(flux.archived_buckets[0].settled_water_ul, -12);
+    assert_eq!(loaded.worldgen_version, 3);
+    assert!(loaded.l0_chunks[0].sleep.dirty_for_save);
+    let field = &loaded.l1_chunks[0];
+    assert_eq!(field.ph_milli[0], 6_537);
+    assert_eq!(
+        [
+            field.microbe_saprotroph[0],
+            field.microbe_conductive[0],
+            field.microbe_halophile[0],
+            field.microbe_ferro[0]
+        ],
+        [2_100, 1_500, 10_300, 25_500]
+    );
+
+    let projected = loaded
+        .sample_l1_at_cell(plain_contracts::CellCoord::new(0, 0))
+        .unwrap()
+        .microbes;
+    let before = world_state_hash(&loaded);
+    loaded.l1_chunks[0].microbe_conductive[0] += 50;
+    let after = world_state_hash(&loaded);
+    assert_eq!(
+        loaded
+            .sample_l1_at_cell(plain_contracts::CellCoord::new(0, 0))
+            .unwrap()
+            .microbes,
+        projected
+    );
+    assert_ne!(before, after);
+    assert_eq!(
+        store
+            .save_incremental(&mut loaded, None)
+            .unwrap()
+            .dirty_chunks_written,
+        1
+    );
+    let reopened = store.load_world().unwrap();
+    assert_eq!(reopened.l1_chunks[0].microbe_conductive[0], 1_550);
+    assert_eq!(world_state_hash(&reopened), after);
     store.close().unwrap();
     std::fs::remove_file(path).unwrap();
 }

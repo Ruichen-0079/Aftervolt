@@ -3,8 +3,8 @@ use plain_contracts::{
     EraPhase, MasterSeed, MultiRateClock, RegionId, WeatherSpectacle, WorldConfig,
 };
 use plain_world::{
-    BasinRole, FieldChunkSoA, MacroFluxRecord, MacroRegion, RegionalMacroFluxHistory,
-    TerrainChunkSoA, WorldTopology,
+    ArchivedFluxRecord, BasinRole, FieldChunkSoA, MacroFluxRecord, MacroRegion,
+    RegionalMacroFluxHistory, TerrainChunkSoA, WorldTopology,
 };
 use serde::{Deserialize, Serialize};
 
@@ -14,13 +14,14 @@ pub enum VersionedWorldMeta {
     V1(WorldMetaV1),
     V2(WorldMetaV2),
     V3(WorldMetaV3),
+    V4(WorldMetaV4),
 }
 
 impl VersionedWorldMeta {
     /// Convert legacy metadata; the store reconciles legacy water after loading L0 chunks.
-    pub fn migrate_to_current(self) -> WorldMetaV3 {
+    pub fn migrate_to_current(self) -> WorldMetaV4 {
         match self {
-            Self::V1(v1) => WorldMetaV3 {
+            Self::V1(v1) => WorldMetaV4 {
                 schema_version: CURRENT_SCHEMA_VERSION,
                 worldgen_version: v1.worldgen_version,
                 seed: v1.seed,
@@ -32,7 +33,7 @@ impl VersionedWorldMeta {
                 surface_reference_height: v1.topology.surface_height.clone(),
                 topology: v1.topology,
             },
-            Self::V2(v2) => WorldMetaV3 {
+            Self::V2(v2) => WorldMetaV4 {
                 schema_version: CURRENT_SCHEMA_VERSION,
                 worldgen_version: v2.worldgen_version,
                 seed: v2.seed,
@@ -44,7 +45,67 @@ impl VersionedWorldMeta {
                 surface_reference_height: v2.topology.surface_height.clone(),
                 topology: v2.topology,
             },
-            Self::V3(v3) => v3,
+            Self::V3(old) => WorldMetaV4 {
+                schema_version: CURRENT_SCHEMA_VERSION,
+                worldgen_version: old.worldgen_version,
+                seed: old.seed,
+                config: old.config,
+                clock: old.clock,
+                initial_world_water_ul: old.initial_world_water_ul,
+                regions: old
+                    .regions
+                    .into_iter()
+                    .map(|region| {
+                        region.map_flux_history(|history| RegionalMacroFluxHistory {
+                            records: history
+                                .records
+                                .into_iter()
+                                .map(|record| MacroFluxRecord {
+                                    macro_step: record.macro_step,
+                                    era: record.era,
+                                    weather: record.weather,
+                                    acid_erosion_impulse: record.acid_erosion_impulse,
+                                    salt_deposition_impulse: record.salt_deposition_impulse,
+                                    flood_peak: record.flood_peak,
+                                    ph_delta: record.ph_delta,
+                                    fertility_delta: record.fertility_delta,
+                                    salinity_delta: record.salinity_delta,
+                                    ambient_charge_v: record.ambient_charge_v,
+                                    net_water_delta_per_col: record.net_water_delta_per_col,
+                                    settled_water_ul: record.settled_water_ul,
+                                    moisture: None,
+                                })
+                                .collect(),
+                            archived_buckets: history
+                                .archived_buckets
+                                .into_iter()
+                                .map(|archive| ArchivedFluxRecord {
+                                    start_step: archive.start_step,
+                                    end_step: archive.end_step,
+                                    era: archive.era,
+                                    acid: archive.acid,
+                                    salt: archive.salt,
+                                    flood_peak: archive.flood_peak,
+                                    flood_exposure: archive.flood_exposure,
+                                    ph: archive.ph,
+                                    fertility: archive.fertility,
+                                    salinity: archive.salinity,
+                                    charge: archive.charge,
+                                    water_per_col: archive.water_per_col,
+                                    settled_water_ul: archive.settled_water_ul,
+                                    moisture: Default::default(),
+                                })
+                                .collect(),
+                            max_len: history.max_len,
+                            discarded_through: history.discarded_through,
+                        })
+                    })
+                    .collect(),
+                surface_reference_height: old.surface_reference_height,
+                surface_salt_inventory: old.surface_salt_inventory,
+                topology: old.topology,
+            },
+            Self::V4(meta) => meta,
         }
     }
 }
@@ -74,20 +135,25 @@ pub struct WorldMetaV2 {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct WorldMetaV3 {
+pub struct WorldMetaV4<H = RegionalMacroFluxHistory> {
     pub schema_version: u32,
     pub worldgen_version: u32,
     pub seed: MasterSeed,
     pub config: WorldConfig,
     pub clock: MultiRateClock,
     pub initial_world_water_ul: i64,
-    pub regions: Vec<MacroRegion>,
+    pub regions: Vec<MacroRegion<H>>,
     pub surface_reference_height: Vec<u16>,
     pub surface_salt_inventory: Vec<f64>,
     pub topology: WorldTopology,
 }
 
-impl WorldMetaV3 {
+// Postcard encodes unit fields as zero bytes. The shared shape therefore retains
+// the V3 layout, which ended before the moisture data on both record types.
+pub type WorldMetaV3 =
+    WorldMetaV4<RegionalMacroFluxHistory<MacroFluxRecord<()>, ArchivedFluxRecord<()>>>;
+
+impl<H> WorldMetaV4<H> {
     pub const fn expected_versions() -> (u32, u32) {
         (CURRENT_SCHEMA_VERSION, CURRENT_WORLDGEN_VERSION)
     }
@@ -296,6 +362,7 @@ impl From<MacroFluxRecordV2> for MacroFluxRecord {
             ambient_charge_v: old.ambient_charge_v,
             net_water_delta_per_col: old.net_water_delta_per_col,
             settled_water_ul: 0,
+            moisture: None,
         }
     }
 }
@@ -305,16 +372,21 @@ impl From<MacroFluxRecordV2> for MacroFluxRecord {
 pub enum VersionedChunkBlob {
     V1(ChunkBlobV1),
     V2(ChunkBlobV2),
+    V3(ChunkBlobV3),
 }
 
 impl VersionedChunkBlob {
-    pub fn migrate_to_current(self) -> ChunkBlobV2 {
+    pub fn migrate_to_current(self) -> ChunkBlobV3 {
         match self {
-            Self::V1(v1) => ChunkBlobV2 {
+            Self::V1(v1) => ChunkBlobV3 {
                 l0: v1.l0,
                 l1: v1.l1.into(),
             },
-            Self::V2(v2) => v2,
+            Self::V2(v2) => ChunkBlobV3 {
+                l0: v2.l0,
+                l1: v2.l1.into(),
+            },
+            Self::V3(v3) => v3,
         }
     }
 }
@@ -327,6 +399,12 @@ pub struct ChunkBlobV1 {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChunkBlobV2 {
+    pub l0: TerrainChunkSoA,
+    pub l1: FieldChunkV2,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChunkBlobV3 {
     pub l0: TerrainChunkSoA,
     pub l1: FieldChunkSoA,
 }
@@ -348,7 +426,30 @@ pub struct FieldChunkV1 {
     pub flux_block_mask: Vec<u8>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FieldChunkV2 {
+    pub axis_len: u8,
+    pub ph_milli: Vec<u16>,
+    pub fertility: Vec<u16>,
+    pub salinity: Vec<u16>,
+    pub temperature_dk: Vec<u16>,
+    pub microbe_saprotroph: Vec<u8>,
+    pub microbe_conductive: Vec<u8>,
+    pub microbe_halophile: Vec<u8>,
+    pub microbe_ferro: Vec<u8>,
+    pub electric_potential: Vec<f32>,
+    pub conductivity: Vec<u16>,
+    /// L0-derived directional wall blocking bitmask (N/S/E/W) preventing thin-wall flux leakage.
+    pub flux_block_mask: Vec<u8>,
+}
+
 impl From<FieldChunkV1> for FieldChunkSoA {
+    fn from(old: FieldChunkV1) -> Self {
+        FieldChunkV2::from(old).into()
+    }
+}
+
+impl From<FieldChunkV1> for FieldChunkV2 {
     fn from(old: FieldChunkV1) -> Self {
         Self {
             ph_milli: old
@@ -364,6 +465,32 @@ impl From<FieldChunkV1> for FieldChunkSoA {
             microbe_conductive: old.microbe_conductive,
             microbe_halophile: old.microbe_halophile,
             microbe_ferro: old.microbe_ferro,
+            electric_potential: old.electric_potential,
+            conductivity: old.conductivity,
+            flux_block_mask: old.flux_block_mask,
+        }
+    }
+}
+
+impl From<FieldChunkV2> for FieldChunkSoA {
+    fn from(old: FieldChunkV2) -> Self {
+        let upgrade = |values: Vec<u8>| {
+            values
+                .into_iter()
+                .map(|value| u16::from(value) * plain_world::spatial::MICROBE_SCALE)
+                .collect()
+        };
+        Self {
+            ph_milli: old.ph_milli,
+            microbial_meso_step: 0,
+            axis_len: old.axis_len,
+            fertility: old.fertility,
+            salinity: old.salinity,
+            temperature_dk: old.temperature_dk,
+            microbe_saprotroph: upgrade(old.microbe_saprotroph),
+            microbe_conductive: upgrade(old.microbe_conductive),
+            microbe_halophile: upgrade(old.microbe_halophile),
+            microbe_ferro: upgrade(old.microbe_ferro),
             electric_potential: old.electric_potential,
             conductivity: old.conductivity,
             flux_block_mask: old.flux_block_mask,

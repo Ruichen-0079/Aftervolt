@@ -79,10 +79,11 @@ pub enum OverlayKind {
     ElectricPotential = 10,
     ChunkActivityDebug = 11,
     BiomeSuitability = 12,
+    ConductivityField = 13,
 }
 
 impl OverlayKind {
-    pub const ALL: [Self; 13] = [
+    pub const ALL: [Self; 14] = [
         Self::CompositeTerrainFluid,
         Self::MaterialYieldStrength,
         Self::PhField,
@@ -94,6 +95,7 @@ impl OverlayKind {
         Self::MicrobeHalophile,
         Self::MicrobeFerro,
         Self::ElectricPotential,
+        Self::ConductivityField,
         Self::ChunkActivityDebug,
         Self::BiomeSuitability,
     ];
@@ -111,6 +113,7 @@ impl OverlayKind {
             Self::MicrobeHalophile => "微生物：固盐产气藻菌",
             Self::MicrobeFerro => "微生物：蚀铁矿化菌",
             Self::ElectricPotential => "局部物理电势场 (L1)",
+            Self::ConductivityField => "电导率场 (L1)",
             Self::ChunkActivityDebug => "Chunk 活跃/休眠与脏区",
             Self::BiomeSuitability => "自然群系涌现宜居度",
         }

@@ -1,6 +1,6 @@
-use plain_contracts::materials::{FluidKind, MaterialId, MATERIALS};
+use plain_contracts::materials::{FluidKind, MaterialId};
 use plain_contracts::{CellCoord, CHUNK_SIZE};
-use plain_world::spatial::{CELL_FLAG_DORMANT_BANK, CELL_FLAG_SUNLIT};
+use plain_world::spatial::{CELL_FLAG_DORMANT_BANK, CELL_FLAG_SUNLIT, MICROBE_SCALE};
 use plain_world::{electric, fields, BasinRole, WorldState};
 
 /// Step 7: Compute L0-derived wall-aware L1 `flux_block_mask`, initialize L1 physicochemical
@@ -77,7 +77,6 @@ pub fn initialize_fields_and_climate(world: &mut WorldState) {
                 let mut metal_cnt = 0u32;
                 let mut heat_core_cnt = 0u32;
                 let mut salt_crust_cnt = 0u32;
-                let mut cond_sum = 0u32;
                 let n_cells = (ds * ds) as u32;
 
                 for dy in 0..ds {
@@ -86,7 +85,6 @@ pub fn initialize_fields_and_climate(world: &mut WorldState) {
                         let li = row + dx;
                         let mat = MaterialId(l0.solid_material[li]);
                         if mat.is_solid() {
-                            cond_sum += MATERIALS.get(mat).conductivity as u32;
                             match mat {
                                 MaterialId::SALT_CRUST => salt_crust_cnt += 1,
                                 MaterialId::TRAVERTINE => travertine_cnt += 1,
@@ -104,15 +102,12 @@ pub fn initialize_fields_and_climate(world: &mut WorldState) {
                             if fv > 500 {
                                 fluid_cnt += 1;
                                 let fk = FluidKind::from_u8(l0.fluid_kind[li]);
-                                cond_sum += fk.base_conductivity() as u32;
                                 match fk {
                                     FluidKind::SaltMarsh => salt_water_cnt += 1,
                                     FluidKind::BlackWater => black_water_cnt += 1,
                                     FluidKind::TravertinePool => travertine_cnt += 1,
                                     _ => {}
                                 }
-                            } else {
-                                cond_sum += 5;
                             }
                         }
                     }
@@ -165,33 +160,29 @@ pub fn initialize_fields_and_climate(world: &mut WorldState) {
                 let temp = base_temp + (heat_core_cnt as f32) * 190.0;
                 l1.temperature_dk[fi] = temp.clamp(2500.0, 3900.0) as u16;
 
-                // Initial 4 microbial continuous fields
-                l1.microbe_saprotroph[fi] = if r_moist > 0.35 && salt_crust_cnt == 0 {
-                    (40.0 + r_fert * 120.0) as u8
+                // Initial microbial densities use the same hundredths as the simulation.
+                let density = |value: f32| (value * f32::from(MICROBE_SCALE)).round() as u16;
+                l1.microbe_saprotroph[fi] = density(if r_moist > 0.35 && salt_crust_cnt == 0 {
+                    40.0 + r_fert * 120.0
                 } else {
-                    12
-                };
-                l1.microbe_conductive[fi] = if metal_cnt > 0 {
-                    (65.0 + r_moist * 90.0) as u8
+                    12.0
+                });
+                l1.microbe_conductive[fi] = density(if metal_cnt > 0 {
+                    65.0 + r_moist * 90.0
                 } else {
-                    14
-                };
-                l1.microbe_halophile[fi] = if salt_water_cnt > 0 || black_water_cnt > 0 {
-                    (90.0 + (fluid_cnt as f32 / n_cells as f32) * 110.0).min(240.0) as u8
+                    14.0
+                });
+                l1.microbe_halophile[fi] = density(if salt_water_cnt > 0 || black_water_cnt > 0 {
+                    (90.0 + (fluid_cnt as f32 / n_cells as f32) * 110.0).min(240.0)
                 } else {
-                    10
-                };
-                l1.microbe_ferro[fi] = if metal_cnt > 0 { 95 } else { 8 };
-
-                l1.conductivity[fi] = ((cond_sum / n_cells.max(1))
-                    + ((sal / 65_535.0) * 260.0) as u32
-                    + (l1.microbe_conductive[fi] as u32))
-                    .min(1500) as u16;
+                    10.0
+                });
+                l1.microbe_ferro[fi] = density(if metal_cnt > 0 { 95.0 } else { 8.0 });
             }
         }
     }
 
-    // 4. Run 2 relaxation sweeps of L1 fields and 1 pass of local electric field so Tick 0 is warm
+    // 4. Relax L1 chemistry and conductivity before the initial potential solve.
     let all_active = vec![true; world.l0_chunks.len()];
     fields::step_l1_fields(world, &all_active);
     electric::solve_local_electric_field(world, &all_active);

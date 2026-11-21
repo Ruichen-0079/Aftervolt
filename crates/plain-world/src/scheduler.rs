@@ -6,10 +6,10 @@ use plain_contracts::telemetry::{
 };
 use plain_contracts::{ChunkCoord, CHUNK_SIZE};
 
-use crate::catchup::{catch_up_active_chunks, catch_up_chunk};
+use crate::catchup::{catch_up_active_chunks, catch_up_fine_tick, catch_up_world};
 use crate::climate::step_macro_climate;
 use crate::electric::{solve_local_electric_field, viewport_chunk_bounds};
-use crate::fields::step_l1_fields;
+use crate::fields::step_scheduled_fields;
 use crate::fluid::step_fluid_active_chunks;
 use crate::spatial::WorldState;
 
@@ -221,11 +221,11 @@ impl WorldSimulation {
 
         // 1. Lazy catch-up for any active LOD-0 chunk lagging behind current macro step (budgeted)
         let t0 = Instant::now();
-        catch_up_active_chunks(&mut self.world, &self.active_chunk_mask, 16);
+        catch_up_fine_tick(&mut self.world, &self.active_chunk_mask, 16);
         self.refresh_ready_mask();
         timings.catchup_us = t0.elapsed().as_micros() as u64;
 
-        // 2. Parallel 4-phase conserved cellular fluid pass on active awake chunks
+        // 2. Conserved cellular fluid pass across active chunks
         let t1 = Instant::now();
         let tick_parity = self.world.clock.tick.0;
         step_fluid_active_chunks(&mut self.world, &self.ready_active_mask, tick_parity);
@@ -241,7 +241,7 @@ impl WorldSimulation {
         // 4. L1 physicochemical & 4-microbe wall-aware fields on meso cadence
         if fire_meso {
             let t3 = Instant::now();
-            step_l1_fields(&mut self.world, &self.ready_active_mask);
+            step_scheduled_fields(&mut self.world, &self.ready_active_mask);
             timings.fields_us = t3.elapsed().as_micros() as u64;
         }
 
@@ -313,10 +313,7 @@ impl WorldSimulation {
 
     /// Catch up every chunk in the entire world (used for persistence/consistency checks).
     pub fn catch_up_all_chunks(&mut self) {
-        let n = self.world.l0_chunks.len();
-        for ci in 0..n {
-            catch_up_chunk(&mut self.world, ci);
-        }
+        catch_up_world(&mut self.world);
     }
 
     pub fn build_profiler_snapshot(&self) -> ProfilerSnapshot {

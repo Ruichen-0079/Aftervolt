@@ -8,7 +8,7 @@ use rayon::prelude::*;
 use rusqlite::{params, Connection};
 use thiserror::Error;
 
-use crate::schema::{ChunkBlobV2, VersionedChunkBlob, VersionedWorldMeta, WorldMetaV3};
+use crate::schema::{ChunkBlobV3, VersionedChunkBlob, VersionedWorldMeta, WorldMetaV4};
 
 #[derive(Debug, Error)]
 pub enum PersistError {
@@ -128,7 +128,7 @@ impl WorldSaveStore {
             .map(|(ci, (l0, l1))| {
                 let cx = (ci % chunks_x) as i32;
                 let cy = (ci / chunks_x) as i32;
-                let blob = VersionedChunkBlob::V2(ChunkBlobV2 {
+                let blob = VersionedChunkBlob::V3(ChunkBlobV3 {
                     l0: l0.clone(),
                     l1: l1.clone(),
                 });
@@ -209,7 +209,7 @@ impl WorldSaveStore {
                 let l0 = &world.l0_chunks[ci];
                 let l1 = &world.l1_chunks[ci];
                 let step = l0.last_realized_macro_step as i64;
-                let blob = VersionedChunkBlob::V2(ChunkBlobV2 {
+                let blob = VersionedChunkBlob::V3(ChunkBlobV3 {
                     l0: l0.clone(),
                     l1: l1.clone(),
                 });
@@ -270,7 +270,10 @@ impl WorldSaveStore {
         let meta_raw = zstd::stream::decode_all(&meta_comp[..])?;
         let versioned_meta: VersionedWorldMeta = postcard::from_bytes(&meta_raw)?;
         let legacy_water = matches!(versioned_meta, VersionedWorldMeta::V1(_));
-        let legacy_history = !matches!(versioned_meta, VersionedWorldMeta::V3(_));
+        let legacy_history = matches!(
+            versioned_meta,
+            VersionedWorldMeta::V1(_) | VersionedWorldMeta::V2(_)
+        );
         let meta = versioned_meta.migrate_to_current();
 
         let chunks_x = meta.config.dimensions.chunks_x as usize;
@@ -306,12 +309,27 @@ impl WorldSaveStore {
         }
 
         // Parallel decompress & deserialize chunks
-        let decoded: Result<Vec<(usize, ChunkBlobV2)>, PersistError> = raw_rows
+        let decoded: Result<Vec<(usize, ChunkBlobV3)>, PersistError> = raw_rows
             .into_par_iter()
             .map(|(idx, comp)| {
                 let raw = zstd::stream::decode_all(&comp[..])?;
                 let vblob: VersionedChunkBlob = postcard::from_bytes(&raw)?;
-                Ok((idx, vblob.migrate_to_current()))
+                let legacy_microbes = !matches!(vblob, VersionedChunkBlob::V3(_));
+                let mut blob = vblob.migrate_to_current();
+                if legacy_microbes {
+                    // Preserve the migration cursor when metadata advances on the next save.
+                    blob.l0.sleep.dirty_for_save = true;
+                    let clock = meta.clock.config;
+                    blob.l1.microbial_meso_step =
+                        if blob.l0.last_realized_macro_step == meta.clock.macro_step.0 {
+                            meta.clock.tick.0
+                        } else {
+                            blob.l0
+                                .last_realized_macro_step
+                                .saturating_mul(clock.ticks_per_macro_step())
+                        } / u64::from(clock.meso_period_ticks.max(1));
+                }
+                Ok((idx, blob))
             })
             .collect();
         let mut decoded = decoded?;
@@ -331,6 +349,7 @@ impl WorldSaveStore {
             clock: meta.clock,
             l0_chunks,
             l1_chunks,
+            groundwater: Default::default(),
             regions: meta.regions,
             topology: meta.topology,
             surface_reference_height: meta.surface_reference_height,
@@ -362,7 +381,7 @@ impl WorldSaveStore {
     }
 
     fn encode_meta(world: &WorldState, zstd_level: i32) -> Result<Vec<u8>, PersistError> {
-        let meta = VersionedWorldMeta::V3(WorldMetaV3 {
+        let meta = VersionedWorldMeta::V4(WorldMetaV4 {
             schema_version: CURRENT_SCHEMA_VERSION,
             worldgen_version: world.worldgen_version,
             seed: world.seed,
